@@ -17,13 +17,26 @@ import { join, relative, sep } from 'node:path'
 /** Forward-slashed path relative to the tree root -> content digest. */
 export type TreeDigests = Map<string, string>
 
-/** Every regular file under `dir`, depth-first, sorted by name at each level. */
+/**
+ * Every regular file under `dir`, depth-first, sorted by name at each level.
+ *
+ * Uses readdir's dirent types rather than a stat per entry. The difference is
+ * one syscall per file against two, which is noise on a demo and is not on a
+ * 24,000-route site where this runs on every build (the seal) and again on
+ * every deploy.
+ */
 function walk(dir: string, visit: (abs: string, rel: string) => void) {
   if (!existsSync(dir)) return
   const rec = (d: string) => {
-    for (const name of readdirSync(d).sort()) {
-      const p = join(d, name)
-      if (statSync(p).isDirectory()) rec(p)
+    const entries = readdirSync(d, { withFileTypes: true })
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    for (const e of entries) {
+      const p = join(d, e.name)
+      // A symlink reports neither isDirectory nor isFile, so it falls through to
+      // the stat below rather than being silently skipped or silently followed.
+      if (e.isDirectory()) rec(p)
+      else if (e.isFile()) visit(p, relative(dir, p).split(sep).join('/'))
+      else if (statSync(p).isDirectory()) rec(p)
       else visit(p, relative(dir, p).split(sep).join('/'))
     }
   }

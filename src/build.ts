@@ -71,11 +71,22 @@ export type Prepared = Resolved & {
 /**
  * Load the store, build the site's indexes, and resolve routes.
  *
- * Run identically on the main thread and inside each worker. Re-resolving per
- * worker is cheap -- milliseconds at 24k routes -- and means slices line up by
- * construction rather than by serialising a route array across the thread
- * boundary, where a 24k-element structured clone per worker would cost more
- * than the work it saved.
+ * Run identically on the main thread and inside each worker, so slices line up
+ * by construction rather than by serialising a route array across the thread
+ * boundary.
+ *
+ * This comment used to claim re-resolving per worker was "cheap -- milliseconds
+ * at 24k routes". Measured in the Phase 2 re-benchmark: **0.60s**, of which
+ * 0.58s is the store load (index 0.02s, route resolution 0.00s). A 10-worker
+ * build pays it eleven times, so ~6.4s of aggregate CPU goes on parsing the
+ * same 20,461 documents over and over -- and that is the largest identified
+ * component of the product's parallel scaling deficit against the Phase 0
+ * harness (1.38x on 10 workers where the harness gets 2.34x).
+ *
+ * The design is not therefore wrong: a 24k-element structured clone per worker
+ * has its own cost, and nobody has measured that alternative. But the number
+ * this rationale rested on was off by roughly two orders of magnitude, so the
+ * decision is now unjustified rather than justified. See bench/RESULTS.md.
  */
 export async function resolveSite(sitePath: string, dbPath: string): Promise<Resolved> {
   const t0 = now()

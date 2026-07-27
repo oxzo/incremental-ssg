@@ -271,3 +271,114 @@ files.** Two rails were added and tested:
   1 ms probe that made the cache worth having.
 - Derivative filenames embed the source basename for debuggability, so renaming a
   source re-encodes it (test 12). Deliberate; content is still the cache key.
+
+---
+
+# Phase 2 — deploy diff, and the product measured against the harness
+
+Run 2026-07-27, same machine. Reproduce with `node bench/run-2.ts` (build and
+deploy figures) and `node bench/run-2-seam.ts` (the comparison below).
+
+**Methodology changed, and the change was necessary.** Every figure in this
+section comes from a **fresh process per measurement**, best of three. The first
+attempt reused one process and reported that turning the determinism guard *off*
+made builds 18% slower, and that `resolveSite` cost less than its own store
+load. Both are impossible. Each 20k build allocates hundreds of megabytes, so
+every run after the first is measured against a different GC state. Numbers from
+that attempt were discarded rather than published. The Phase 0 table above used
+best-of-two within one process; it is not directly comparable to what follows,
+which is why the harness was re-run here rather than quoted.
+
+## The deploy diff
+
+23,441 routes, 320 MB of output, heavy tier, 10 workers.
+
+| operation | time | moved |
+|---|---:|---|
+| hash the output tree | 0.68s | 23,441 files, 320 MB |
+| cold deploy (nothing live) | 2.71s | 23,441 uploaded, 320 MB |
+| no-op rebuild | 1.82s | **0 uploaded**, 23,441 unchanged |
+| after one title edit | 1.79s | **7 uploaded**, 7 purged |
+
+Seven files out of 23,441. Phase 0 predicted 8 for a title edit by diffing
+per-route input signatures; this is the same claim measured on emitted bytes
+through the real pipeline, and it lands in the same place. The diff costs ~1.8s
+against a ~14s build — about 13%, for a 3,300× reduction in what gets uploaded.
+
+Hashing runs at ~470 MB/s and is the dominant term. Listing a directory target
+is free; a real paginating target will not be.
+
+## Product pipeline vs Phase 0 harness
+
+Both pipelines, this machine, this hour, same method. Normalised by **MB
+written per second**, because the two corpora resolve to slightly different
+route counts (23,441 vs 24,449) and pages/s would quietly reward whichever
+produced smaller pages. Page sizes are in fact close — 11.05 vs 11.19 KB — so
+the corpora are well matched.
+
+| configuration | product | harness | product throughput |
+|---|---:|---:|---:|
+| plain / light, 1 thread | 12.91s | 11.48s | **−16%** |
+| plain / light, 10 workers | 9.37s | 4.91s | **−50%** |
+| highlight / heavy, 1 thread | 46.59s | 43.57s | **−11%** |
+| highlight / heavy, 10 workers | 13.86s | 9.93s | **−31%** |
+
+Pool speedup: product **1.38×** (light) and **3.36×** (heavy), against the
+harness's **2.34×** and **4.39×**.
+
+**The single-threaded cost of the engine/site seam is 11–16%.** Modest, and the
+price of a site being a module rather than hardcoded.
+
+**The parallel cost is the real one, and it is 31–50%.** The seam did not make
+rendering much slower; it made the worker pool much worse.
+
+### Where it goes
+
+`resolveSite` — what every worker repeats — costs **0.60s**: store load 0.58s,
+index 0.02s, route resolution 0.00s. A 10-worker build runs it eleven times
+(once on the main thread purely to count routes for slicing, once per worker),
+so **~6.4s of aggregate CPU is spent parsing the same 20,461 documents over and
+over**.
+
+`src/build.ts` justified that design with the claim that re-resolving per worker
+is "cheap — milliseconds at 24k routes". It is 600ms. The comment was wrong by
+roughly two orders of magnitude, which does not make the design wrong — a
+24k-element structured clone per worker has its own cost, and nobody has
+measured the alternative — but it does mean the decision is currently
+unjustified rather than justified.
+
+### What was ruled out
+
+- **The determinism guard is not the cause.** Guard on measured 12.91–15.45s,
+  guard off 14.89–15.08s, single-threaded. The ranges overlap, so at this
+  precision there is **no measurable guard cost** in either direction. An
+  earlier reading of "13% faster with the guard on" was best-of-three arithmetic
+  over overlapping spreads and should not have been quoted.
+- **Site indexing is not the cause.** 0.02s.
+- **Route resolution is not the cause.** Under 5ms.
+- **Environment drift does not explain it.** The harness ran 10% slower today
+  than when Phase 0 recorded it (11.48s vs 10.48s light single-threaded), which
+  is why it was re-run rather than quoted. A 10% box difference does not produce
+  a 50% throughput gap.
+
+### Not yet ruled out
+
+Per-worker ESM module loading (each thread imports the site module, its
+templates, and markdown-it or shiki), memory-bandwidth saturation from ten
+concurrent 165 MB parses, and static slicing — `ceil(routes/workers)` contiguous
+routes each, so an uneven cost distribution leaves the build waiting on the
+slowest slice. The harness uses the same static slicing and scales better, so
+slicing cannot be the whole story.
+
+## Corrections to figures quoted elsewhere
+
+**The 8.8s headline is not the product's number.** It was the harness at 24,449
+routes with highlighting. The equivalent product figure is **13.86s**, and the
+harness re-measured today is 9.93s. The conclusion Phase 0 drew is untouched —
+a full rebuild remains far inside any webhook-to-live budget, and the crossover
+to a painful build moves from ~150,000 routes to roughly ~100,000 — but the
+specific number should be quoted as 13.86s from here on.
+
+Sync was re-measured incidentally: 20,461 documents, 41 requests, 158 MB,
+1.66s — **81 µs/doc** against Phase 2b's 67 µs/doc, the difference explained by
+this corpus's larger bodies.

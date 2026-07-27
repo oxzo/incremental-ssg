@@ -24,6 +24,7 @@
 import { readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { join, extname } from 'node:path'
 import { hashTree, statTree } from './hash-tree.ts'
+import { pool } from './pool.ts'
 import type { TreeDigests } from './hash-tree.ts'
 
 /** Bumped when a change here makes an existing seal file unreadable. */
@@ -239,22 +240,6 @@ const CONTENT_TYPES: Record<string, string> = {
 
 export function contentTypeFor(path: string): string {
   return CONTENT_TYPES[extname(path).toLowerCase()] ?? 'application/octet-stream'
-}
-
-/** Bounded-parallel map. Uploads are the one stage here with real latency. */
-async function pool<T>(jobs: (() => Promise<T>)[], width: number): Promise<T[]> {
-  const out: T[] = new Array(jobs.length)
-  let i = 0
-  await Promise.all(
-    Array.from({ length: Math.min(width, jobs.length) }, async () => {
-      for (;;) {
-        const k = i++
-        if (k >= jobs.length) return
-        out[k] = await jobs[k]()
-      }
-    }),
-  )
-  return out
 }
 
 /**

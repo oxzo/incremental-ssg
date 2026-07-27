@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto'
 import { readFile, writeFile, rename, mkdir, readdir, unlink, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join, basename, extname } from 'node:path'
+import { pool } from './pool.ts'
 
 export type Fmt = 'jpeg' | 'webp' | 'avif' | 'png'
 
@@ -170,7 +171,7 @@ export class AssetCache {
       }
     }
 
-    const derivatives = await runPool(jobs, this.cfg.concurrency)
+    const derivatives = await pool(jobs, this.cfg.concurrency)
     const srcset: Record<string, string> = {}
     for (const fmt of this.cfg.formats) {
       srcset[fmt] = derivatives
@@ -236,15 +237,3 @@ export class AssetCache {
   }
 }
 
-async function runPool<T>(jobs: (() => Promise<T>)[], width: number): Promise<T[]> {
-  const out: T[] = new Array(jobs.length)
-  let i = 0
-  await Promise.all(Array.from({ length: Math.min(width, jobs.length) }, async () => {
-    while (true) {
-      const k = i++
-      if (k >= jobs.length) return
-      out[k] = await jobs[k]()
-    }
-  }))
-  return out
-}

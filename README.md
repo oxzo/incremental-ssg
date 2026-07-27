@@ -9,7 +9,7 @@ diff that uploads only the files an edit actually changed.
 No build step: Node's native type stripping runs the TypeScript directly.
 
 ```sh
-npm test          # 110 tests
+npm test          # 116 tests
 npm run demo      # mock CMS -> sync -> assets -> render -> write -> deploy
 npm run cli help
 ```
@@ -20,19 +20,26 @@ Phase 0 measured the thing the project was named after and found nothing to
 save. Full details in `bench/RESULTS.md`; the three results that decided it:
 
 - Full-build throughput is **flat** in corpus size — ~2,350 pages/s per thread
-  across a 40× range. 24,449 routes with syntax highlighting rebuild in **8.8s**
-  on a worker pool. The crossover to a painful (>60s) build sits past ~150,000
-  routes.
+  across a 40× range. ~23,400 routes with syntax highlighting rebuild in
+  **13.9s** on a worker pool. The crossover to a painful (>60s) build sits
+  somewhere past ~100,000 routes.
+
+  (The often-quoted **8.8s** was the Phase 0 *harness*, not this pipeline. The
+  Phase 2 re-benchmark measured both on one machine: the engine/site seam costs
+  11–16% single-threaded and 31–50% on a worker pool, almost all of it in
+  per-worker store loading. The verdict is unaffected — a full rebuild is still
+  far inside any webhook budget — but quote 13.9s.)
 - A content edit invalidates 5–9 routes whether the site has 500 pages or
   20,000 — constant, not proportional.
 - A **new post invalidates ~9% of all routes at every scale** (pagination shift
   in the date-sorted archive), and a nav or settings edit invalidates **100%**.
   No dependency graph helps with either.
 
-Phase 2b then found where the time actually goes: image processing costs roughly
-**3,200× rendering** — 7.9 hours against 8.8 seconds at 20,000 sources. So the
-expensive half got a cache and the cheap half did not. That asymmetry is the
-whole design.
+Phase 2b then found where the time actually goes: image processing costs three
+orders of magnitude more than rendering — **7.9 hours against ~14 seconds** at
+20,000 sources. So the expensive half got a cache and the cheap half did not.
+That asymmetry is the whole design, and it is wide enough that the seam
+regression above does not dent it.
 
 ## Pipeline
 
@@ -143,16 +150,19 @@ deletes without an id listing.
 No real host adapter exists yet. `src/deploy-mock.ts` is a directory standing in
 for the live site, the same call this project already made for the CMS.
 
-**Known limits, none of them measured yet.** The diff reads every byte of the
-output tree to hash it, image derivatives included — at 20,000 sources that is
-far more I/O than the HTML, and it is the cost that will dominate at scale. A
-shortcut exists and is deliberately not taken: derivative filenames already
-contain their content hash, so those paths could be digested from their names,
-at the price of coupling the deploy stage to the asset naming scheme. Listing
-cost is unmeasured too — a real target paginates, so a 24,449-object site is
-~25 requests, and Phase 2b's finding was that request *count* dominates. The
-demo's numbers are a smoke signal, not a measurement; nothing here has been run
-at Phase 0 scale.
+**Measured at scale** (23,441 routes, 320 MB; full table in `bench/RESULTS.md`):
+hashing the output tree costs **0.68s** at ~470 MB/s and is the dominant term; a
+no-op rebuild deploys in **1.82s** moving nothing; a one-post title edit uploads
+**7 files of 23,441**. So the diff costs ~13% of a build to avoid uploading
+3,300× more than necessary.
+
+**Known limits.** Hashing reads every byte, image derivatives included — at
+20,000 sources that is far more I/O than the HTML. A shortcut exists and is
+deliberately not taken: derivative filenames already contain their content hash,
+so those paths could be digested from their names, at the price of coupling the
+deploy stage to the asset naming scheme. Listing cost is still unmeasured — a
+directory target is free, but a real target paginates, so a 24,449-object site
+is ~25 requests and Phase 2b's finding was that request *count* dominates.
 
 ## AVIF effort is the largest single tunable
 
@@ -189,7 +199,7 @@ yet; `src/cms-mock.ts` is currently the only target.
 | `src/determinism.ts` | the render-window guard |
 | `src/render.ts` | markdown, render context, `ctx.image` / `ctx.picture` |
 | `src/build.ts`, `src/render-worker.ts` | build driver, worker pool, build seal |
-| `src/hash-tree.ts` | tree digests — the byte-identity check and the diff primitive |
+| `src/hash-tree.ts`, `src/pool.ts` | tree digests, and the one bounded-parallel map |
 | `src/deploy.ts`, `src/deploy-mock.ts` | the deploy diff, its rails, and a directory target |
 | `src/cli.ts` | `sync`, `build`, and `deploy` commands |
 | `example/blog/` | the example site, its sample corpus, and `demo.ts` |

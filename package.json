@@ -12,7 +12,9 @@
     "cli": "node --no-warnings src/cli.ts",
     "gate": "node --no-warnings bench/run.ts",
     "bench:sync-assets": "node --no-warnings bench/run-2b.ts",
-    "bench:asset-cache": "node --no-warnings bench/run-2c.ts"
+    "bench:asset-cache": "node --no-warnings bench/run-2c.ts",
+    "bench:phase2": "node --no-warnings bench/run-2.ts",
+    "bench:seam": "node --no-warnings bench/run-2-seam.ts"
   },
   "dependencies": {
     "markdown-it": "^14.1.0",
