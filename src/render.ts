@@ -7,6 +7,7 @@ import MarkdownIt from 'markdown-it'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { mimeOf } from './assets.ts'
+import { allowNondeterministic } from './determinism.ts'
 import type { AssetManifest } from './assets.ts'
 import type { AssetEntry } from './asset-cache.ts'
 import type { MarkdownTier, PictureOptions, RenderContext, Route, SiteConfig } from './config.ts'
@@ -18,6 +19,40 @@ export type Renderer = { md: MarkdownIt; tier: MarkdownTier }
  * is why the tier is a site-level choice rather than always-on. Shiki's
  * highlighter is built once per thread; building it per page dominated
  * everything else in an early harness run.
+ *
+ * `tokenizeTimeLimit: 0` is load-bearing and must not be tidied away. Shiki
+ * defaults it to 500ms *per line*, and the underlying tokenizer implements that
+ * budget by reading the wall clock and, on expiry, returning a partial token
+ * stream and carrying on. So a sufficiently pathological line yields different
+ * HTML depending on how loaded the machine was at that instant -- and this build
+ * runs ten workers competing for cores, which is exactly when it would trigger.
+ *
+ * That defect would be close to undebuggable from its symptom: a handful of
+ * pages differing between two builds of identical content, appearing and
+ * disappearing with machine load, surfacing to a user as a deploy diff that
+ * re-uploads pages nobody edited. The determinism guard caught it on the first
+ * highlighted build ever run through the product, which is the argument for the
+ * guard.
+ *
+ * Setting it to 0 disables the bailout, so a pathological line takes as long as
+ * it takes. That is the right trade here and it is the project's stated one: a
+ * build whose failure mode is *slow* beats one whose failure mode is *silently
+ * wrong*.
+ *
+ * The exemption is then needed because the tokenizer stamps its start time
+ * *before* testing whether the budget is enabled, so the call happens even
+ * though its value is now dead. Verified by reading the vendored tokenizer: the
+ * timestamp's only consumer sits inside a `timeLimit !== 0` branch.
+ *
+ * Be precise about what protects this, because it is tempting to over-credit
+ * the test suite. The byte-identity test catches a *deterministic* divergence
+ * in this path and will fail loudly if an upgrade changes the emitted markup.
+ * It cannot catch a reinstated time budget: that bailout only fires on a
+ * pathologically slow line, so a green run is one sample of a race — the same
+ * weak evidence a passing concurrency test provides. What actually protects
+ * this is the explicit `tokenizeTimeLimit: 0` and this comment. Re-read the
+ * tokenizer when shiki is upgraded; do not infer from a green suite that the
+ * budget is still off.
  */
 export async function createRenderer(tier: MarkdownTier = 'plain'): Promise<Renderer> {
   if (tier === 'plain') {
@@ -29,7 +64,10 @@ export async function createRenderer(tier: MarkdownTier = 'plain'): Promise<Rend
     html: true,
     linkify: true,
     highlight: (code, lang) =>
-      lang === 'ts' ? hl.codeToHtml(code, { lang: 'ts', theme: 'github-dark' }) : '',
+      lang === 'ts'
+        ? allowNondeterministic(() =>
+            hl.codeToHtml(code, { lang: 'ts', theme: 'github-dark', tokenizeTimeLimit: 0 }))
+        : '',
   })
   return { md, tier }
 }

@@ -35,6 +35,13 @@ const para = (rnd: () => number) =>
     return s.charAt(0).toUpperCase() + s.slice(1) + '.'
   }).join(' ')
 
+function postBody(rnd: () => number, paras: number, code: boolean): string {
+  const parts = [para(rnd), `## ${words(rnd, 3)}`]
+  for (let i = 1; i < Math.max(1, paras); i++) parts.push(para(rnd))
+  if (code) parts.push('```ts\n' + CODE_SAMPLE + '\n```')
+  return parts.join('\n\n') + '\n'
+}
+
 /** Fixed epoch, never Date.now() -- corpora must be byte-identical across runs. */
 export const EPOCH = 1_700_000_000_000
 
@@ -46,7 +53,27 @@ export type CorpusOptions = {
   seed?: number
   /** Assign these image keys round-robin as post heroes. */
   heroes?: string[]
+  /**
+   * Paragraphs per post body. The default keeps the demo and the test suite
+   * fast; the Phase 0 benchmark corpus is ~900 words, which is roughly 30.
+   */
+  paras?: number
+  /**
+   * Include a fenced code block, so the 'highlight' markdown tier has something
+   * to highlight. Without one the heavy tier costs the same as the light tier
+   * and any comparison against Phase 0 is measuring the wrong thing.
+   */
+  code?: boolean
 }
+
+const CODE_SAMPLE = `export function fingerprint(deps: Dep[], code: string): string {
+  const h = createHash('sha256')
+  for (const d of deps.sort((a, b) => a.key < b.key ? -1 : 1)) {
+    h.update(d.key); h.update('\\0'); h.update(d.hash); h.update('\\0')
+  }
+  h.update(code)
+  return h.digest('hex').slice(0, 16)
+}`
 
 /** CMS-shaped documents. Fed through the mock server and the real sync driver. */
 export function blogDocs(opts: CorpusOptions = {}): MockDoc[] {
@@ -83,7 +110,7 @@ export function blogDocs(opts: CorpusOptions = {}): MockDoc[] {
       // Descending: post-0 is newest, so a new post inserts at the top of every
       // archive -- the pagination-shift case Phase 0 measured.
       date: EPOCH - i * 3_600_000,
-      body: `${para(rnd)}\n\n## ${words(rnd, 3)}\n\n${para(rnd)}\n`,
+      body: postBody(rnd, opts.paras ?? 2, opts.code ?? false),
     }
     if (heroes.length > 0) doc.hero = heroes[i % heroes.length]
     put('post', doc, EPOCH - i * 3_600_000)

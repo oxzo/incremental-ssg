@@ -11,6 +11,7 @@ const STAMPED_ENFORCE = resolve(import.meta.dirname, 'sites/stamped-enforce.ts')
 const STAMPED_OFF = resolve(import.meta.dirname, 'sites/stamped-off.ts')
 const NO_TEMPLATE = resolve(import.meta.dirname, 'sites/no-template.ts')
 const BLOG_ASSETS = resolve(import.meta.dirname, 'sites/blog-assets.ts')
+const BLOG_HIGHLIGHT = resolve(import.meta.dirname, 'sites/blog-highlight.ts')
 
 // The asset-site module reads these at import time and ESM caches it, so they
 // are fixed once for the whole file rather than per test.
@@ -79,6 +80,32 @@ describe('build', () => {
     const { writeFileSync } = await import('node:fs')
     writeFileSync(join(b, 'index.html'), readFileSync(join(b, 'index.html'), 'utf8') + ' ')
     assert.notDeepEqual(fingerprint(a), fingerprint(b), 'one trailing byte must be enough to fail the check')
+  })
+
+  test('highlighted builds are byte-identical, which is what licenses the exemption', async () => {
+    // The syntax highlighter is the one place in the codebase where the
+    // determinism guard is deliberately suspended, on the argument that the
+    // tokenizer's clock read cannot reach the output. That argument was made by
+    // reading a pinned dependency, so this is the check that survives an
+    // upgrade: two builds of one corpus, one of them on a busy worker pool
+    // (which is exactly the condition a wall-clock bailout would fire under).
+    const db = join(work('build-hl-db'), 'content.db')
+    await seedStore(db, blogDocs({ posts: 8, code: true }))
+    const a = join(work('build-hl-a'), 'dist')
+    const b = join(work('build-hl-b'), 'dist')
+    const plain = join(work('build-hl-plain'), 'dist')
+    await build({ site: BLOG_HIGHLIGHT, dbPath: db, outDir: a, workers: 1, skipAssets: true })
+    await build({ site: BLOG_HIGHLIGHT, dbPath: db, outDir: b, workers: 4, skipAssets: true })
+    assert.deepEqual(fingerprint(a), fingerprint(b))
+
+    // And the highlighter actually ran — otherwise this asserts that two
+    // unhighlighted builds match, which the plain-tier test already covers.
+    await build({ site: BLOG, dbPath: db, outDir: plain, workers: 1, skipAssets: true })
+    const page = join('posts', 'post-0', 'index.html')
+    assert.notEqual(
+      readFileSync(join(a, page), 'utf8'),
+      readFileSync(join(plain, page), 'utf8'),
+      'the highlight tier must produce different HTML than the plain tier')
   })
 
   test('the worker pool produces the same bytes as the single-threaded path', async () => {

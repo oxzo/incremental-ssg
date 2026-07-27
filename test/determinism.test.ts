@@ -1,6 +1,8 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { beginDeterministicWindow, runDeterministic, DeterminismError } from '../src/determinism.ts'
+import {
+  beginDeterministicWindow, runDeterministic, allowNondeterministic, DeterminismError,
+} from '../src/determinism.ts'
 
 describe('determinism window', () => {
   test('Date.now() throws and the error names the route', () => {
@@ -92,6 +94,56 @@ describe('determinism window', () => {
     } finally {
       w.end()
     }
+  })
+
+  test('an exemption permits the call and returns the real value', () => {
+    // The claim an exemption makes is "this cannot affect output", not "time has
+    // stopped" -- so it hands the callee a real clock, because a library given a
+    // frozen one may take paths nobody reasoned about.
+    const before = Date.now()
+    const inside = runDeterministic('/', () => allowNondeterministic(() => Date.now()))
+    assert.ok(inside >= before && inside <= Date.now())
+    assert.equal(runDeterministic('/', () => allowNondeterministic(() => typeof Math.random())), 'number')
+  })
+
+  test('the guard is back the instant the exemption returns', () => {
+    assert.throws(
+      () => runDeterministic('/', () => {
+        allowNondeterministic(() => Date.now())
+        return Date.now()
+      }),
+      DeterminismError)
+  })
+
+  test('an exemption that throws still restores the guard', () => {
+    // The failure this prevents is the worst kind: an exemption leaking past its
+    // own scope silently disarms the guard for the rest of the build.
+    assert.throws(
+      () => runDeterministic('/', () => {
+        try {
+          allowNondeterministic(() => { throw new Error('boom') })
+        } catch { /* swallowed on purpose */ }
+        return Date.now()
+      }),
+      DeterminismError)
+  })
+
+  test('nested exemptions restore one level at a time', () => {
+    assert.throws(
+      () => runDeterministic('/', () => {
+        allowNondeterministic(() => {
+          allowNondeterministic(() => Date.now())
+          // Still inside the outer exemption, so this must not throw.
+          Date.now()
+        })
+        return Date.now()
+      }),
+      DeterminismError)
+  })
+
+  test('an exemption outside any window is inert', () => {
+    assert.equal(typeof allowNondeterministic(() => Date.now()), 'number')
+    assert.equal(typeof Date.now(), 'number')
   })
 
   test('end() is idempotent', () => {

@@ -48,6 +48,39 @@ export type DeterminismWindow = {
   end(): void
 }
 
+let exemptDepth = 0
+
+/**
+ * Run `fn` with the guard suspended, for a call that reads a clock but provably
+ * cannot let the reading reach the output.
+ *
+ * This exists because the guard checks *calls*, and the honest version of the
+ * property is about *effects* -- so a library that reads the clock and discards
+ * the value is a false positive. The real case, and the reason this is not
+ * hypothetical: the syntax highlighter's tokenizer stamps a start time on every
+ * line before checking whether a time budget is even enabled. With the budget
+ * disabled the value is dead, but the call still happens.
+ *
+ * The bar for using it is high, and it is a bar about evidence rather than
+ * intent: read the callee and confirm the clock value cannot influence what it
+ * returns. "It's probably fine" does not qualify -- if the value can reach the
+ * output on any path, this converts a loud failure into a silent one, which is
+ * the exact trade this whole module exists to refuse. The standing backstop is
+ * the byte-identity test, which does check effects, and which will fail if an
+ * exemption was granted wrongly or a dependency upgrade invalidates one.
+ *
+ * Synchronous only. An `await` inside `fn` would leak the exemption to whatever
+ * else runs on the loop before it resumes.
+ */
+export function allowNondeterministic<T>(fn: () => T): T {
+  exemptDepth++
+  try {
+    return fn()
+  } finally {
+    exemptDepth--
+  }
+}
+
 const NOOP_WINDOW: DeterminismWindow = { setLabel() {}, end() {} }
 
 /**
@@ -68,12 +101,17 @@ export function beginDeterministicWindow(mode: 'enforce' | 'off' = 'enforce'): D
 
   const guardedDate = new Proxy(realDate, {
     construct(target, args, newTarget) {
-      if (args.length === 0) throw new DeterminismError('new Date()', label)
+      if (args.length === 0 && exemptDepth === 0) throw new DeterminismError('new Date()', label)
       return Reflect.construct(target, args, newTarget)
     },
     get(target, prop, receiver) {
       if (prop === 'now') {
         return () => {
+          // Inside an exemption the real value is returned rather than a fake
+          // constant: the claim being made is "this cannot affect output", not
+          // "time has stopped", and a library handed a frozen clock may behave
+          // in ways nobody reasoned about.
+          if (exemptDepth > 0) return realDate.now()
           throw new DeterminismError('Date.now()', label)
         }
       }
@@ -87,6 +125,7 @@ export function beginDeterministicWindow(mode: 'enforce' | 'off' = 'enforce'): D
   })
 
   Math.random = () => {
+    if (exemptDepth > 0) return realRandom()
     throw new DeterminismError('Math.random()', label)
   }
   restores.push(() => {
@@ -121,9 +160,10 @@ function patchMethod(
   restores: (() => void)[],
 ) {
   if (!host || typeof host[name] !== 'function') return
-  const real = host[name]
+  const real = host[name] as (...args: unknown[]) => unknown
   try {
-    host[name] = () => {
+    host[name] = (...args: unknown[]) => {
+      if (exemptDepth > 0) return real.apply(host, args)
       throw new DeterminismError(api, label())
     }
   } catch {
