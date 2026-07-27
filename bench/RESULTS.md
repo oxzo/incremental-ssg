@@ -382,3 +382,95 @@ specific number should be quoted as 13.86s from here on.
 Sync was re-measured incidentally: 20,461 documents, 41 requests, 158 MB,
 1.66s — **81 µs/doc** against Phase 2b's 67 µs/doc, the difference explained by
 this corpus's larger bodies.
+
+---
+
+# Phase 2 addendum — the store-load fix, and a retraction
+
+Run 2026-07-27, same machine, shortly after the section above. **That section's
+product-vs-harness table was wrong and is retracted; the corrected figures are
+below.**
+
+## What was wrong
+
+Product builds were charged for `rmSync` deleting the previous run's 23,441
+output files — roughly 2.3s — because the product cleans *inside* `build()` while
+the harness path cleaned outside its timer. Every product row paid it and no
+harness row did. Best-of-N compounded it by systematically preferring whichever
+run found the least to delete, which for the first configuration measured is an
+empty directory.
+
+The tell was the same one that caught the first methodology error, and it was
+again not implausibility: **total wall time stopped equalling the sum of the
+phases it reported** — 14.7s total against 0.30 load + 0.01 index + 12.05 render.
+`bench/one-build.ts` now empties the output directory before the clock starts,
+for both pipelines.
+
+A second correction, of technique rather than code: **configurations measured in
+separate batches are not comparable on this machine.** A first pass reported the
+fixes making single-threaded builds 7% *slower*; interleaving the two variants
+A/B/A/B showed the fixed build faster in all four pairs with no overlap. Sustained
+load drifts the box more than the effect being measured, so every figure below
+comes from interleaved runs.
+
+## The fixes
+
+**A composite `(type, id)` index on `documents`.** The only type-filtered query in
+the engine reads `ORDER BY type, id`, and the index was on `(type)` alone, so
+SQLite satisfied the filter and then built a temp B-tree, dragging all 158 MB of
+JSON through the sorter. Measured at 20,461 documents before touching anything:
+
+| | |
+|---|---:|
+| ordered read (temp B-tree) | 460ms |
+| the same read, unordered | 158ms |
+| `JSON.parse` of all of it | 129ms |
+| ordered read with `(type, id)` | 170ms |
+
+So ~300ms was pure sorting, and parsing — the thing that looked like the obvious
+culprit — was never the problem. Row order was verified byte-identical across all
+20,461 documents before the change was trusted. `resolveSite`: **0.60s → 0.33s**.
+
+**The parent no longer resolves the site in parallel mode.** It was loading and
+parsing every document purely to learn the route count for slicing, serially,
+before any worker could start. Workers now derive their own slice from
+`(index, count)`. This also made cross-worker agreement checkable, and it is now
+checked — see the build source.
+
+## Measured effect (interleaved, 4 pairs)
+
+| configuration | before | after | |
+|---|---:|---:|---:|
+| light, 1 thread | 11.50–11.56s | 11.13–11.26s | −2.5% |
+| light, 10 workers | 6.30–6.55s | 4.97–5.12s | **−22%** |
+
+Single-threaded barely moves, which is right: one thread pays the fixed cost once.
+The pool is where eleven redundant loads lived.
+
+## Corrected product vs harness (interleaved, 3 pairs)
+
+| configuration | product | harness | product throughput |
+|---|---:|---:|---:|
+| light, 1 thread | 11.24s / 259 MB | 10.32s / 274 MB | −13% |
+| light, 10 workers | 5.07s | 4.49s | −16% |
+| **heavy, 10 workers** | **9.62s** | **9.66s** | **−4%** |
+
+Pool speedup: product **2.22×** light and **4.5×** heavy, against the harness's
+**2.30×** and **4.45×**.
+
+**The parallel scaling deficit is gone.** It was reported as 1.38× against 2.34×;
+part of that gap was the clean-cost artefact and part was real, and the real part
+is now fixed. On the heavy tier — the CPU-bound configuration Phase 0 headlined —
+the product and the harness are indistinguishable in wall time, and the remaining
+4% is that the product writes 259/320 MB where the harness writes 274/334.
+
+The light tier keeps a genuine 13–16% deficit. It is write-I/O bound, so per-byte
+throughput is the fair measure there and the product is behind on it. Unexplained,
+and not chased further.
+
+## Figures to quote from here on
+
+**A 20,000-post site with syntax highlighting rebuilds in ~9.6s** on ten workers
+(43.5s single-threaded). Not 8.8s (the harness, and a faster day), and not 13.9s
+(the contaminated measurement above it). The Phase 0 verdict is untouched and was
+never close to the line.

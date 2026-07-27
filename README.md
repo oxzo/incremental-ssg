@@ -21,14 +21,14 @@ save. Full details in `bench/RESULTS.md`; the three results that decided it:
 
 - Full-build throughput is **flat** in corpus size — ~2,350 pages/s per thread
   across a 40× range. ~23,400 routes with syntax highlighting rebuild in
-  **13.9s** on a worker pool. The crossover to a painful (>60s) build sits
+  **~9.6s** on a worker pool. The crossover to a painful (>60s) build sits
   somewhere past ~100,000 routes.
 
-  (The often-quoted **8.8s** was the Phase 0 *harness*, not this pipeline. The
-  Phase 2 re-benchmark measured both on one machine: the engine/site seam costs
-  11–16% single-threaded and 31–50% on a worker pool, almost all of it in
-  per-worker store loading. The verdict is unaffected — a full rebuild is still
-  far inside any webhook budget — but quote 13.9s.)
+  (Two other numbers are in circulation and both are wrong. **8.8s** was the
+  Phase 0 *harness* on a faster day. **13.9s** came from a benchmark that charged
+  the product for deleting its previous output while the harness was not charged
+  — retracted in `bench/RESULTS.md`. Measured properly and interleaved, the
+  product and the harness are indistinguishable on this tier.)
 - A content edit invalidates 5–9 routes whether the site has 500 pages or
   20,000 — constant, not proportional.
 - A **new post invalidates ~9% of all routes at every scale** (pagination shift
@@ -36,7 +36,7 @@ save. Full details in `bench/RESULTS.md`; the three results that decided it:
   No dependency graph helps with either.
 
 Phase 2b then found where the time actually goes: image processing costs three
-orders of magnitude more than rendering — **7.9 hours against ~14 seconds** at
+orders of magnitude more than rendering — **7.9 hours against ~10 seconds** at
 20,000 sources. So the expensive half got a cache and the cheap half did not.
 That asymmetry is the whole design, and it is wide enough that the seam
 regression above does not dent it.
@@ -192,7 +192,7 @@ yet; `src/cms-mock.ts` is currently the only target.
 | path | what |
 |---|---|
 | `src/config.ts` | the `SiteConfig` seam and the site loader |
-| `src/store.ts` | SQLite document mirror |
+| `src/store.ts` | SQLite document mirror (see the `(type, id)` index comment) |
 | `src/cms.ts`, `src/cms-mock.ts` | adapter interface, HTTP adapter, mock CMS |
 | `src/sync.ts` | full/delta pull, hashing, delete reconciliation |
 | `src/assets.ts`, `src/asset-cache.ts` | the asset stage and its cache |
