@@ -7,7 +7,10 @@
     "node": ">=22.18.0"
   },
   "scripts": {
-    "gate": "node --no-warnings bench/run.ts"
+    "test": "node --no-warnings --test test/**/*.test.ts",
+    "gate": "node --no-warnings bench/run.ts",
+    "bench:sync-assets": "node --no-warnings bench/run-2b.ts",
+    "bench:asset-cache": "node --no-warnings bench/run-2c.ts"
   },
   "dependencies": {
     "markdown-it": "^14.1.0",

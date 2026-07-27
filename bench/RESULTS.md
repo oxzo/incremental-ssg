@@ -204,3 +204,70 @@ Actions, in order of value:
    asset cost up further — in the direction that strengthens the conclusion.
 4. **SQLite upsert** was measured with one transaction per page; batching larger
    would cut the 1.30s store cost.
+
+---
+
+# Phase 2c — the asset cache, built
+
+Implementation in `src/asset-cache.ts`, tests in `test/asset-cache.test.ts`
+(`npm test`, 15 tests). Benchmark `npm run bench:asset-cache`.
+
+24 sources (3000×2000, ~2 MB each), WebP + AVIF at effort 0, four widths —
+192 derivatives:
+
+| build | wall time | hits | misses | speedup |
+|---|---:|---:|---:|---:|
+| cold (empty cache) | 4.23s | 0 | 192 | — |
+| warm (no changes) | **33ms** | 192 | 0 | **130×** |
+| warm (1 source edited) | 214ms | 184 | 8 | 19.8× |
+
+Extrapolated to 20,000 sources: ~59 min cold, ~27s warm. Against the 8.8s full
+render, a steady-state build of a 20,000-image site is roughly 36s — versus an
+hour without the cache.
+
+## What makes it safe
+
+The derivative file's existence *is* the cache entry; there is no side table to
+fall out of sync. Two properties carry the weight, and both are tested:
+
+- **The spec hash covers every parameter that can change output bytes** — format,
+  width, quality, effort, and the sharp/libvips versions. Without the encoder
+  params in the key, flipping `effort` from 4 to 0 would silently reuse old
+  derivatives and the build would serve output no current config can reproduce.
+  Tests 3 and 4 assert a quality or effort change is a miss.
+- **Writes are atomic** (temp file + rename). A cache keyed on "the file exists"
+  must never observe a partial write, or one interrupted build poisons the cache
+  with a truncated image that reads as a hit forever. Test 6 decodes every
+  emitted derivative and asserts its actual width.
+
+Width is deliberately *not* a global invalidator: it is per-derivative, so
+narrowing `widths` from `[100,200]` to `[100,250]` reuses 100 and encodes only
+250 (test 5).
+
+## A hazard the benchmark surfaced
+
+The first bench run reported `gc deleted 8 (expected 0)`. That was not a cache
+bug — gc had been called on an instance that had processed the site *before* an
+edit, so its keep-set was stale and the 8 newly-created derivatives looked like
+orphans. Correct behaviour under a dangerous contract: **any partial or failed
+build holds an incomplete keep-set, and collecting against it deletes live
+files.** Two rails were added and tested:
+
+1. `gc()` throws unless `seal()` was called, marking the build complete.
+2. `gc()` refuses to delete more than 50% of the directory without `{force:true}`,
+   guarding the "processed 3 sources, collected 20,000" failure.
+
+## Limits
+
+- **The warm path still reads every source file in full** to content-hash it —
+  ~40 GB of reads for 20,000 sources at 2 MB each. The 27s warm extrapolation
+  assumes page-cache-warm reads, as the 24-source sample certainly was, so a
+  cold-filesystem warm build will be slower. The standard fix is an
+  `(mtime, size)` fast path, which reintroduces exactly the side table and
+  staleness risk this design otherwise avoids. Not taken yet; measure first.
+- **Externally corrupted derivatives are still served.** Atomic writes mean *our*
+  builds never create partials, but the existence check does not validate
+  content, and validating would mean decoding every derivative — which is the
+  1 ms probe that made the cache worth having.
+- Derivative filenames embed the source basename for debuggability, so renaming a
+  source re-encodes it (test 12). Deliberate; content is still the cache key.
