@@ -12,6 +12,7 @@ const STAMPED_OFF = resolve(import.meta.dirname, 'sites/stamped-off.ts')
 const NO_TEMPLATE = resolve(import.meta.dirname, 'sites/no-template.ts')
 const BLOG_ASSETS = resolve(import.meta.dirname, 'sites/blog-assets.ts')
 const BLOG_HIGHLIGHT = resolve(import.meta.dirname, 'sites/blog-highlight.ts')
+const UNSTABLE = resolve(import.meta.dirname, 'sites/unstable-routes.ts')
 
 // The asset-site module reads these at import time and ESM caches it, so they
 // are fixed once for the whole file rather than per test.
@@ -119,6 +120,29 @@ describe('build', () => {
     assert.equal(r1.routes, r4.routes)
     assert.equal(r1.bytes, r4.bytes)
     assert.deepEqual(fingerprint(one), fingerprint(many))
+  })
+
+  test('workers that resolve different route sets fail the build', async () => {
+    // The parent no longer resolves the site — each worker does, and computes
+    // its own slice from (index, count). That makes "every worker resolved the
+    // same site" load-bearing, so it is checked rather than assumed. Without
+    // the check these slices would silently overlap and leave gaps.
+    await assert.rejects(
+      () => build({
+        site: UNSTABLE, dbPath: plainDb, outDir: join(work('build-unstable'), 'dist'),
+        workers: 4, skipAssets: true,
+      }),
+      /workers disagree on the route set/)
+  })
+
+  test('a single worker cannot disagree with itself, so the same site builds fine', async () => {
+    // Negative control: the fixture above is only unstable *across* threads. If
+    // this also failed, the check would be firing on something else.
+    const r = await build({
+      site: UNSTABLE, dbPath: plainDb, outDir: join(work('build-unstable-1'), 'dist'),
+      workers: 1, skipAssets: true,
+    })
+    assert.ok(r.routes > 0)
   })
 
   test('a worker pool wider than the route list still renders every route', async () => {

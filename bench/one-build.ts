@@ -36,11 +36,26 @@ const { values } = parseArgs({
 const site = values.site as string
 const db = values.db as string
 
+// Empty the output directory BEFORE the clock starts, for both pipelines.
+//
+// This was the second methodology bug in this benchmark, and it was worse than
+// the first because it was a comparison error rather than a noise error. The
+// harness path cleaned outside its own timer while the product path passed
+// `clean: true` into build(), which cleans inside. So every product figure was
+// charged ~2.3s for deleting the previous run's 23,441 files and every harness
+// figure was not -- and best-of-N made it worse, systematically favouring
+// whichever run happened to find the least to delete (the first run into a
+// fresh directory finds nothing).
+//
+// The tell, again, was internal inconsistency rather than implausibility: total
+// wall time did not equal the sum of the phases it reported.
+const outDir = values.out as string
+if (outDir) clean(outDir)
+
 if (values.harness) {
-  const out = values.out as string
+  const out = outDir
   const tier = (values.tier ?? 'light') as 'light' | 'heavy'
   const workers = Number(values.workers ?? 1)
-  clean(out)
   const r = workers === 1
     ? await buildSingle(db, out, tier)
     : await buildParallel(db, out, tier, workers)
@@ -54,8 +69,11 @@ if (values.harness) {
     total: performance.now() - t, ms: r.ms, documents: r.documents, routes: r.routes.length,
   }))
 } else {
+  // clean: true is kept so the seal records a clean build (the deploy diff
+  // refuses otherwise), but the directory is already empty, so it costs nothing
+  // and neither pipeline is charged for it.
   const r = await build({
-    site, dbPath: db, outDir: values.out as string,
+    site, dbPath: db, outDir,
     workers: Number(values.workers ?? 1), clean: true, skipAssets: true,
   })
   process.stdout.write(JSON.stringify({

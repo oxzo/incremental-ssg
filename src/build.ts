@@ -161,6 +161,30 @@ export function renderRange(
   return { pages, bytes }
 }
 
+/**
+ * The contiguous route range worker `index` of `count` is responsible for.
+ *
+ * Exported so the worker and the single-threaded path derive slices from one
+ * definition. When the parent computed ranges and the worker trusted them, this
+ * arithmetic existed once; now that both sides reason about it, two copies would
+ * be a gap or an overlap waiting to happen.
+ */
+export function sliceFor(total: number, index: number, count: number): { start: number; end: number } {
+  const per = Math.ceil(total / count)
+  const start = Math.min(total, index * per)
+  return { start, end: Math.min(total, start + per) }
+}
+
+/** What each render worker reports back. */
+export type WorkerReport = {
+  pages: number
+  bytes: number
+  /** Routes this worker resolved -- the parent checks every worker agrees. */
+  routes: number
+  documents: number
+  ms: Resolved['ms']
+}
+
 export function clean(outDir: string) {
   rmSync(outDir, { recursive: true, force: true })
 }
@@ -205,43 +229,81 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   const assetMs = now() - ta
 
   const workers = Math.max(1, opts.workers ?? Math.max(1, cpus().length - 2))
-  // In parallel mode the main thread needs routes for slicing but never renders,
-  // so it skips building a renderer it would not use.
-  const p =
-    workers === 1
-      ? await prepare(sitePath, dbPath, manifestPath)
-      : await resolveSite(sitePath, dbPath)
 
   const tr = now()
   let bytes = 0
+  let routes: number
+  let documents: number
+  let resolveMs: Resolved['ms']
+
   if (workers === 1) {
-    bytes = renderRange(p as Prepared, outDir, 0, p.routes.length).bytes
+    const p = await prepare(sitePath, dbPath, manifestPath)
+    bytes = renderRange(p, outDir, 0, p.routes.length).bytes
+    routes = p.routes.length
+    documents = p.documents
+    resolveMs = p.ms
   } else {
-    const per = Math.ceil(p.routes.length / workers)
+    // The main thread deliberately does not resolve the site. It used to, purely
+    // to learn the route count for slicing -- a full load and parse of every
+    // document (0.34s at 20,461 documents, and 0.60s before the store gained its
+    // (type, id) index) sitting on the critical path before a single worker could
+    // start. Every worker resolves anyway, so the count is already there; the
+    // parent just tells each one which of N it is.
+    //
+    // The cost of not knowing the count: a pool wider than the route list spawns
+    // workers whose slice is empty, and each still resolves the site before
+    // discovering it has nothing to do. The old shape skipped those. Bounded in
+    // practice -- `workers` defaults to cores-2 and any real site has far more
+    // routes than cores -- so this trades a pathological case nobody runs for
+    // ~340ms off the critical path of every real build.
     const workerUrl = new URL('./render-worker.ts', import.meta.url)
-    const jobs = Array.from({ length: workers }, (_, w) => {
-      const start = w * per
-      const end = Math.min(p.routes.length, start + per)
-      return new Promise<{ pages: number; bytes: number }>((res, rej) => {
-        if (start >= end) return res({ pages: 0, bytes: 0 })
+    const jobs = Array.from({ length: workers }, (_, index) =>
+      new Promise<WorkerReport>((res, rej) => {
         const wk = new Worker(fileURLToPath(workerUrl), {
-          workerData: { sitePath, dbPath, outDir, manifestPath, start, end },
+          workerData: { sitePath, dbPath, outDir, manifestPath, index, count: workers },
         })
-        let out = { pages: 0, bytes: 0 }
+        let out: WorkerReport | null = null
         wk.on('message', (m) => {
-          if (m && m.error) rej(new Error(`worker rendering [${start},${end}): ${m.error}`))
-          else out = m
+          if (m && m.error) rej(new Error(`worker ${index} of ${workers}: ${m.error}`))
+          else out = m as WorkerReport
         })
         wk.on('error', rej)
-        wk.on('exit', (c) => (c === 0 ? res(out) : rej(new Error(`worker exit ${c}`))))
-      })
-    })
+        wk.on('exit', (c) => {
+          if (c !== 0) return rej(new Error(`worker ${index} exited ${c}`))
+          if (out === null) return rej(new Error(`worker ${index} exited without reporting`))
+          res(out)
+        })
+      }))
     const done = await Promise.all(jobs)
+
+    // Every worker resolved the site independently, so they must agree on what
+    // the site *is*. Under the previous shape the parent resolved once and
+    // handed out ranges, which made a worker resolving a different route set
+    // impossible to notice -- it would simply render the wrong slice of a
+    // different site and report success.
+    const counts = [...new Set(done.map((d) => d.routes))]
+    if (counts.length > 1) {
+      throw new Error(
+        `workers disagree on the route set: resolved ${counts.join(' vs ')} routes. ` +
+        `Site resolution must be a pure function of the store, and something here ` +
+        `is not -- a build assembled from these slices would have gaps, overlaps, ` +
+        `or both.`)
+    }
+    routes = counts[0] ?? 0
+    documents = done[0]?.documents ?? 0
+    // The slowest worker's, because that is what the wall clock actually waited
+    // on. Reporting the fastest would understate the fixed cost this stage pays.
+    resolveMs = {
+      load: Math.max(...done.map((d) => d.ms.load)),
+      index: Math.max(...done.map((d) => d.ms.index)),
+      routes: Math.max(...done.map((d) => d.ms.routes)),
+    }
+
     const rendered = done.reduce((a, b) => a + b.pages, 0)
-    if (rendered !== p.routes.length) {
+    if (rendered !== routes) {
       // Slice arithmetic is the one place a silent gap produces a site that is
       // missing pages while every worker reports success.
-      throw new Error(`rendered ${rendered} pages but resolved ${p.routes.length} routes`)
+      throw new Error(`rendered ${rendered} pages but resolved ${routes} routes`)
     }
     bytes = done.reduce((a, b) => a + b.bytes, 0)
   }
@@ -255,9 +317,9 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   const tree = statTree(outDir)
   const seal: BuildSeal = {
     schema: SEAL_SCHEMA,
-    site: p.cfg.name,
+    site: cfgProbe.name,
     outDir,
-    routes: p.routes.length,
+    routes,
     files: tree.files,
     bytes: tree.bytes,
     clean: opts.clean === true,
@@ -265,17 +327,17 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   writeSeal(workDir, seal)
 
   return {
-    site: p.cfg.name,
-    documents: p.documents,
-    routes: p.routes.length,
+    site: cfgProbe.name,
+    documents,
+    routes,
     bytes,
     workers,
     assets,
     seal,
     ms: {
-      load: p.ms.load,
-      index: p.ms.index,
-      routes: p.ms.routes,
+      load: resolveMs.load,
+      index: resolveMs.index,
+      routes: resolveMs.routes,
       assets: assetMs,
       render: renderMs,
       total: now() - t0,

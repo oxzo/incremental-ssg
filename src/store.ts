@@ -56,7 +56,20 @@ export class DocumentStore {
         hash TEXT NOT NULL,
         json TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(type);
+      -- (type, id) rather than (type). byType() is the only type-filtered query
+      -- in the engine and it reads ORDER BY type, id -- with an index on type
+      -- alone SQLite satisfied the filter and then built a temp B-tree for the
+      -- sort, dragging all 158 MB of JSON through the sorter. Measured at 20,461
+      -- documents: 460ms ordered against 158ms unordered, so roughly 300ms was
+      -- pure sorting. The composite index removes the temp B-tree entirely and
+      -- the same read costs 170ms. It is paid once per worker plus once on the
+      -- main thread, so at ten workers this is the difference between ~6.4s and
+      -- ~3s of aggregate CPU.
+      CREATE INDEX IF NOT EXISTS idx_documents_type_id ON documents(type, id);
+      -- Strictly redundant now: any query that could use (type) can use the
+      -- leftmost prefix of (type, id). Kept as a DROP rather than left in place
+      -- so sync does not maintain a second index that nothing reads.
+      DROP INDEX IF EXISTS idx_documents_type;
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `)
     const found = this.getMeta('schema')
