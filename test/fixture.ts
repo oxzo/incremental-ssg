@@ -4,9 +4,8 @@
 // Working files go to real disk under .tmp/ rather than /tmp, which is tmpfs on
 // the dev box. Tests do not measure anything, but the benchmarks next door do,
 // and one convention beats remembering which directory is a RAM disk.
-import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { createHash } from 'node:crypto'
-import { join, resolve, relative, sep } from 'node:path'
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { startMockCms } from '../src/cms-mock.ts'
 import { httpCmsAdapter } from '../src/cms.ts'
 import { DocumentStore } from '../src/store.ts'
@@ -28,30 +27,10 @@ export function cleanup(dir: string) {
   rmSync(dir, { recursive: true, force: true })
 }
 
-/**
- * Content fingerprint of an output tree: sorted `relpath sha256` lines.
- *
- * Comparing these between two builds is the direct test of success criterion 1
- * ("output is a pure function of content plus code"). Comparing route counts or
- * spot-checking a page would pass while a footer timestamp quietly made every
- * file differ -- which is exactly the failure the Phase 2 deploy diff cannot
- * survive.
- */
-export function hashTree(dir: string): string[] {
-  const out: string[] = []
-  const walk = (d: string) => {
-    for (const name of readdirSync(d).sort()) {
-      const p = join(d, name)
-      if (statSync(p).isDirectory()) walk(p)
-      else {
-        const rel = relative(dir, p).split(sep).join('/')
-        out.push(`${rel} ${createHash('sha256').update(readFileSync(p)).digest('hex')}`)
-      }
-    }
-  }
-  walk(dir)
-  return out.sort()
-}
+// `hashTree` used to live here. Phase 2 promoted it to src/hash-tree.ts, since
+// the deploy diff needs the same primitive and two implementations of "hash the
+// output tree" in one repository is how they drift. Tests import `fingerprint`
+// from there directly.
 
 /**
  * Fill a store by running the real pipeline: mock CMS over HTTP, real adapter,

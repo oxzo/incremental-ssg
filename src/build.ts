@@ -19,9 +19,12 @@ import { loadSite } from './config.ts'
 import { runAssetStage, emptyManifest } from './assets.ts'
 import { createContextFactory, createRenderer, renderRoute, writeOut } from './render.ts'
 import { beginDeterministicWindow } from './determinism.ts'
+import { clearSeal, writeSeal, SEAL_SCHEMA } from './deploy.ts'
+import { statTree } from './hash-tree.ts'
 import type { Route, SiteConfig } from './config.ts'
 import type { AssetManifest, AssetStageResult } from './assets.ts'
 import type { Renderer } from './render.ts'
+import type { BuildSeal } from './deploy.ts'
 
 const now = () => performance.now()
 
@@ -47,6 +50,8 @@ export type BuildResult = {
   bytes: number
   workers: number
   assets: AssetStageResult | null
+  /** Proof this build finished, and the deploy diff's precondition. */
+  seal: BuildSeal
   ms: { load: number; index: number; routes: number; assets: number; render: number; total: number }
 }
 
@@ -157,6 +162,12 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   const workDir = resolve(opts.workDir ?? dirname(dbPath))
   if (opts.clean) clean(outDir)
 
+  // Drop any previous seal before emitting a byte. A build that dies halfway
+  // must leave no seal behind, or the next deploy reads the *last* build's
+  // completion token as proof that this truncated tree is whole and starts
+  // deleting live pages that this build simply never got to.
+  clearSeal(workDir)
+
   // The asset stage runs on the main thread before any route renders, so
   // `ctx.image()` can be a synchronous lookup and every derivative exists
   // exactly once. See src/assets.ts for why it is a stage and not a callback.
@@ -225,6 +236,23 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   }
   const renderMs = now() - tr
 
+  // Written last, and only here: every route has rendered and the count has
+  // been checked. `files`/`bytes` come from a stat walk rather than the render
+  // totals because assets are hardlinked into the output too, and the seal has
+  // to describe the whole emitted tree -- that is what lets the deploy notice a
+  // tree that lost files after the build rather than during it.
+  const tree = statTree(outDir)
+  const seal: BuildSeal = {
+    schema: SEAL_SCHEMA,
+    site: p.cfg.name,
+    outDir,
+    routes: p.routes.length,
+    files: tree.files,
+    bytes: tree.bytes,
+    clean: opts.clean === true,
+  }
+  writeSeal(workDir, seal)
+
   return {
     site: p.cfg.name,
     documents: p.documents,
@@ -232,6 +260,7 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     bytes,
     workers,
     assets,
+    seal,
     ms: {
       load: p.ms.load,
       index: p.ms.index,

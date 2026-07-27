@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { build } from '../src/build.ts'
-import { tmpdir, cleanup, hashTree, seedStore, blogDocs, makeImages } from './fixture.ts'
+import { tmpdir, cleanup, seedStore, blogDocs, makeImages } from './fixture.ts'
+import { fingerprint } from '../src/hash-tree.ts'
 
 const BLOG = resolve(import.meta.dirname, '../example/blog/site.ts')
 const STAMPED_ENFORCE = resolve(import.meta.dirname, 'sites/stamped-enforce.ts')
@@ -44,7 +45,7 @@ describe('build', () => {
     assert.ok(r.routes > POSTS, 'routes exceed posts — archives, tags, authors, pages')
     assert.ok(r.bytes > 0)
     // The invariant that catches slice arithmetic bugs and silent skips alike.
-    assert.equal(hashTree(out).length, r.routes, 'one output file per resolved route')
+    assert.equal(fingerprint(out).length, r.routes, 'one output file per resolved route')
 
     for (const f of ['index.html', 'posts/post-0/index.html', 'sitemap.xml', 'feed.xml',
                      'posts/page/1/index.html', 'authors/author-0/index.html']) {
@@ -61,23 +62,23 @@ describe('build', () => {
     const b = join(work('build-det-b'), 'dist')
     await build({ site: BLOG, dbPath: plainDb, outDir: a, workers: 1, skipAssets: true })
     await build({ site: BLOG, dbPath: plainDb, outDir: b, workers: 1, skipAssets: true })
-    assert.deepEqual(hashTree(a), hashTree(b))
+    assert.deepEqual(fingerprint(a), fingerprint(b))
   })
 
   test('the byte-identical check can actually detect a difference', async () => {
     // Negative control for the test above. Without it, "two builds match" would
-    // pass just as happily if hashTree compared two empty lists or ignored file
+    // pass just as happily if fingerprint compared two empty lists or ignored file
     // contents -- the strongest test in the suite would be the emptiest, and
     // nothing would say so.
     const a = join(work('build-neg-a'), 'dist')
     const b = join(work('build-neg-b'), 'dist')
     await build({ site: BLOG, dbPath: plainDb, outDir: a, workers: 1, skipAssets: true })
     await build({ site: BLOG, dbPath: plainDb, outDir: b, workers: 1, skipAssets: true })
-    assert.deepEqual(hashTree(a), hashTree(b))
+    assert.deepEqual(fingerprint(a), fingerprint(b))
 
     const { writeFileSync } = await import('node:fs')
     writeFileSync(join(b, 'index.html'), readFileSync(join(b, 'index.html'), 'utf8') + ' ')
-    assert.notDeepEqual(hashTree(a), hashTree(b), 'one trailing byte must be enough to fail the check')
+    assert.notDeepEqual(fingerprint(a), fingerprint(b), 'one trailing byte must be enough to fail the check')
   })
 
   test('the worker pool produces the same bytes as the single-threaded path', async () => {
@@ -90,13 +91,13 @@ describe('build', () => {
     assert.equal(r4.workers, 4)
     assert.equal(r1.routes, r4.routes)
     assert.equal(r1.bytes, r4.bytes)
-    assert.deepEqual(hashTree(one), hashTree(many))
+    assert.deepEqual(fingerprint(one), fingerprint(many))
   })
 
   test('a worker pool wider than the route list still renders every route', async () => {
     const out = join(work('build-wide'), 'dist')
     const r = await build({ site: BLOG, dbPath: plainDb, outDir: out, workers: 64, skipAssets: true })
-    assert.equal(hashTree(out).length, r.routes)
+    assert.equal(fingerprint(out).length, r.routes)
   })
 
   test('clean removes output from a previous build', async () => {
@@ -222,7 +223,7 @@ describe('build — asset integration', () => {
     const b = join(work('build-asset-b'), 'dist')
     await build({ site: BLOG_ASSETS, dbPath: assetDb, outDir: a, workers: 1 })
     await build({ site: BLOG_ASSETS, dbPath: assetDb, outDir: b, workers: 3 })
-    assert.deepEqual(hashTree(a), hashTree(b))
+    assert.deepEqual(fingerprint(a), fingerprint(b))
   })
 
   test('a hero naming an unprocessed source fails the build', async () => {
