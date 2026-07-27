@@ -163,7 +163,12 @@ describe('AssetCache', () => {
     const out = join(root, 'o7')
     const src = join(srcDir, 'race.png')
     await makeImage(src, 300, 200)
+    // Four writers, not two. With two, a temp-filename collision between
+    // instances only fails about half the time -- which is how the per-instance
+    // counter bug survived Phase 2c and only surfaced once the suite got busier.
     const [x, y] = await Promise.all([
+      new AssetCache(cfg(out)).process(src),
+      new AssetCache(cfg(out)).process(src),
       new AssetCache(cfg(out)).process(src),
       new AssetCache(cfg(out)).process(src),
     ])

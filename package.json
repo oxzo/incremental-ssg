@@ -8,6 +8,8 @@
   },
   "scripts": {
     "test": "node --no-warnings --test test/**/*.test.ts",
+    "demo": "node --no-warnings example/blog/demo.ts",
+    "cli": "node --no-warnings src/cli.ts",
     "gate": "node --no-warnings bench/run.ts",
     "bench:sync-assets": "node --no-warnings bench/run-2b.ts",
     "bench:asset-cache": "node --no-warnings bench/run-2c.ts"

@@ -16,6 +16,7 @@
 //      exists" must never observe a half-written file, or an interrupted build
 //      poisons the cache with a truncated image that looks like a hit forever.
 import sharp from 'sharp'
+import { threadId } from 'node:worker_threads'
 import { createHash } from 'node:crypto'
 import { readFile, writeFile, rename, mkdir, readdir, unlink, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -48,6 +49,18 @@ export const defaultConfig = (outDir: string): AssetConfig => ({
 /** Bumped when a change to this file alters output bytes for an unchanged input. */
 const CACHE_SCHEMA = 1
 
+/**
+ * Temp-file sequence, module-scoped rather than per-instance.
+ *
+ * Per-instance was a bug: two AssetCache instances in one process share a pid
+ * and both start their counter at zero, so they build the *same* temp filename
+ * for the same derivative. One renames it into place and the other's rename
+ * fails with ENOENT -- an intermittent build failure in the one code path whose
+ * whole job is to never be observed half-done. Module scope plus threadId makes
+ * the name unique per writer instead of per process.
+ */
+let tmpSeq = 0
+
 const sha = (b: Buffer | string, n = 16) => createHash('sha256').update(b).digest('hex').slice(0, n)
 const ext = (f: Fmt) => (f === 'jpeg' ? 'jpg' : f)
 
@@ -74,7 +87,6 @@ export class AssetCache {
   }
   /** Every derivative filename this build referenced — the GC keep-set. */
   private referenced = new Set<string>()
-  private tmpCounter = 0
   private cfg: AssetConfig
   private publicPath: string
   private sealed = false
@@ -113,7 +125,7 @@ export class AssetCache {
 
   /** Atomic publish: a reader must never see a partially written derivative. */
   private async writeAtomic(file: string, buf: Buffer) {
-    const tmp = `${file}.tmp-${process.pid}-${this.tmpCounter++}`
+    const tmp = `${file}.tmp-${process.pid}-${threadId}-${tmpSeq++}`
     await writeFile(tmp, buf)
     await rename(tmp, file)
   }
