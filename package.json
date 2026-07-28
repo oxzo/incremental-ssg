@@ -9,7 +9,8 @@
   },
   "scripts": {
     "test": "node --no-warnings --test test/**/*.test.ts",
-    "typecheck": "tsc -p tsconfig.json && tsc -p demo/worker/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "typecheck:worker": "tsc -p demo/worker/tsconfig.json",
     "test:mutate": "python3 tools/mutate.py",
     "demo": "node --no-warnings example/blog/demo.ts",
     "stack:up": "bash stack/up.sh",

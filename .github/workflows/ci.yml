@@ -42,6 +42,17 @@ jobs:
       - name: type check
         run: npm run typecheck
 
+      # demo/worker is its own npm package with its own lockfile, so the root
+      # `npm ci` does not install it. Checking it needs its devDependencies
+      # present -- which the first CI run discovered, having passed locally only
+      # because a previous manual install had left them on the machine. That is
+      # the whole argument for this file in one step.
+      - name: install demo worker deps
+        run: npm ci --prefix demo/worker
+
+      - name: type check the demo worker
+        run: npm run typecheck:worker
+
       - name: tests
         run: npm test
 

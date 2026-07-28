@@ -381,8 +381,12 @@ npm run test:mutate  # break each rail in turn; every one must fail a test
 npm audit --omit=dev
 ```
 
-`typecheck` covers two projects: the root, and `demo/worker` against the
-Cloudflare runtime whose globals are not Node's.
+`demo/worker` is a separate npm package and is checked separately, against the
+Cloudflare runtime whose globals are not Node's:
+
+```sh
+npm ci --prefix demo/worker && npm run typecheck:worker
+```
 
 CI runs all four on the Node version `engines` declares as the floor and on
 current. The mutation harness is a separate job because it takes minutes rather
