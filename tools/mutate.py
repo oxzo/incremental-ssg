@@ -442,6 +442,54 @@ MUTATIONS: list[Mutation] = [
         "the shape this replaced: two workers resolving different route sets of equal length agree and the build ships the mixture",
         "test/route-plan.test.ts",
     ),
+    # --- draining a pool before reporting that it failed ----------------------
+    #
+    # Both pools used to reject while their work continued. The tell was not in
+    # the code, which reads correctly, but in the effects: a rejected promise
+    # says nothing about the threads and runners behind it. Each mutation here
+    # restores one half of the old behaviour, and the tests that kill them have
+    # to be able to fail by *observing more work than they asked for* -- a shape
+    # no assertion on the rejection value can reach.
+    Mutation(
+        "pool-runs-on-after-failure",
+        "src/pool.ts",
+        "        if (failed) return",
+        "        if (false) return",
+        "runners keep pulling after a sibling threw, so the deploy uploads the rest of the list into a live bucket after deploy() reported failure",
+        "test/pool.test.ts",
+    ),
+    Mutation(
+        "pool-falsy-throw-ignored",
+        "src/pool.ts",
+        "        if (failed) return",
+        "        if (failure !== undefined) return",
+        "a job throwing undefined reads as no-failure-yet, so the pool rejects with undefined having run the whole list anyway",
+        "test/pool.test.ts",
+    ),
+    Mutation(
+        "pool-last-failure-wins",
+        "src/pool.ts",
+        "          if (!failed) {",
+        "          if (true) {",
+        "a later failure overwrites the first, and the rejection sends a reader to a consequence rather than the cause",
+        "test/pool.test.ts",
+    ),
+    Mutation(
+        "build-pool-not-drained",
+        "src/build.ts",
+        "      await Promise.all(threads.map((wk) => wk.terminate()))",
+        "      await Promise.resolve()",
+        "surviving workers render on after build() rejected and after the build lock was released, writing into a tree nobody is holding",
+        "test/build.test.ts",
+    ),
+    Mutation(
+        "build-drain-loses-the-diagnosis",
+        "src/build.ts",
+        "      throw e",
+        "      throw new Error('the build failed and its worker pool was drained')",
+        "the drain replaces the failure that caused it, so the report names the cleanup instead of the bug",
+        "test/build.test.ts",
+    ),
     # --- the injection proxy, which is test infrastructure that can also lie ---
     Mutation(
         "proxy-truncation-is-a-noop",

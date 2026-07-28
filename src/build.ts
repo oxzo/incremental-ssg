@@ -356,11 +356,16 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     // routes than cores -- so this trades a pathological case nobody runs for
     // ~340ms off the critical path of every real build.
     const workerUrl = new URL('./render-worker.ts', import.meta.url)
+    // Handles kept, not just promises. A promise that has rejected says nothing
+    // about the thread behind it, and what has to be waited on here is the
+    // thread.
+    const threads: Worker[] = []
     const jobs = Array.from({ length: workers }, (_, index) =>
       new Promise<WorkerReport>((res, rej) => {
         const wk = new Worker(fileURLToPath(workerUrl), {
           workerData: { sitePath, dbPath, outDir, manifestPath, index, count: workers },
         })
+        threads.push(wk)
         let out: WorkerReport | null = null
         wk.on('message', (m) => {
           if (m && m.error) rej(new Error(`worker ${index} of ${workers}: ${m.error}`))
@@ -373,7 +378,40 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
           res(out)
         })
       }))
-    const done = await Promise.all(jobs)
+
+    // Promise.all rejects on the first worker to fail, and the others go on
+    // rendering: they hold no lock and answer to nobody. Measured before this
+    // existed, with worker 0 failing fast and three siblings rendering slowly --
+    // build() rejected 91ms in having written nothing, the next writer took the
+    // build lock immediately, and all 120 of the survivors' output entries
+    // appeared afterwards. Not a tail past the release. All of it, after.
+    //
+    // The lock is not the place to fix that. A lock that promised "held until
+    // the writers are quiet" would have to be told what to wait for, so a caller
+    // that forgot to register still leaks and the lock carries a guarantee it
+    // cannot keep -- which is the defect this codebase keeps finding, one layer
+    // down. Draining here means build() cannot return while a thread of its own
+    // is alive, so withLock's release-in-a-finally already releases into
+    // quiescence and claims nothing new to do it.
+    let done: WorkerReport[]
+    try {
+      done = await Promise.all(jobs)
+    } catch (e) {
+      // terminate() rather than awaiting a natural exit, because a natural exit
+      // is not bounded: a worker wedged in a render would turn a failed build
+      // into a hang, which this project treats as the worse result. It stops a
+      // thread inside a tight synchronous loop -- nothing polite to interrupt --
+      // in 4ms measured, and an idle-blocked one in 0ms.
+      //
+      // Rethrow the original. The terminated siblings exit non-zero and reject
+      // their own promises on the way out, but Promise.all has already settled
+      // on the first failure, so those are ignored rather than unhandled. The
+      // first failure is the diagnosis; an exit code this line caused is not.
+      await Promise.all(threads.map((wk) => wk.terminate()))
+      throw e
+    }
+    // No drain on the success path: every job promise resolves from its own
+    // 'exit' event, so arriving here already means every thread is gone.
 
     // Every worker resolved the site independently, so they must agree on what
     // the site *is*. Under the previous shape the parent resolved once and

@@ -13,6 +13,7 @@ const NO_TEMPLATE = resolve(import.meta.dirname, 'sites/no-template.ts')
 const BLOG_ASSETS = resolve(import.meta.dirname, 'sites/blog-assets.ts')
 const BLOG_HIGHLIGHT = resolve(import.meta.dirname, 'sites/blog-highlight.ts')
 const UNSTABLE = resolve(import.meta.dirname, 'sites/unstable-routes.ts')
+const FAILING_WORKER = resolve(import.meta.dirname, 'sites/failing-worker.ts')
 
 // The asset-site module reads these at import time and ESM caches it, so they
 // are fixed once for the whole file rather than per test.
@@ -160,6 +161,60 @@ describe('build', () => {
     writeFileSync(stale, 'old')
     await build({ site: BLOG, dbPath: plainDb, outDir: out, workers: 1, skipAssets: true, clean: true })
     assert.equal(existsSync(stale), false)
+  })
+})
+
+// A failed build used to return while its surviving workers went on rendering.
+// They hold no lock and answer to nobody: measured before the drain existed,
+// build() rejected 91ms in having written nothing, the next writer took the
+// build lock immediately, and all 120 of the survivors' output entries appeared
+// afterwards -- not a tail past the release, all of it.
+describe('build — the worker pool drains before it reports failure', () => {
+  let db = ''
+  before(async () => {
+    db = join(work('build-drain'), 'content.db')
+    await seedStore(db, blogDocs({ posts: 1 }))
+  })
+
+  // Counted as files rather than routes: what matters is bytes reaching the
+  // output directory, whoever wrote them.
+  const written = (dir: string) => (existsSync(dir) ? fingerprint(dir).length : 0)
+
+  /** Long enough that undrained siblings would finish all ten of their pages. */
+  const settle = () => new Promise((r) => setTimeout(r, 1200))
+
+  test('no worker writes anything after build() has rejected', async () => {
+    const out = join(work('build-drain-out'), 'dist')
+    await assert.rejects(
+      () => build({ site: FAILING_WORKER, dbPath: db, outDir: out, workers: 4, skipAssets: true }),
+      // Also the diagnosis check: the reported failure is worker 0's own error
+      // and not "worker N exited 1", which is what terminating the siblings
+      // makes them say on the way out.
+      /worker 0 of 4: Error: worker 0 fails on purpose/)
+    const atReject = written(out)
+    await settle()
+    assert.equal(written(out), atReject, 'a worker kept writing after the build failed')
+    // Worker 0 fails before any sibling finishes its first page, so a drained
+    // pool leaves the output directory untouched rather than merely stable.
+    assert.equal(atReject, 0)
+  })
+
+  test('the same site fails in-process too, so the fixture is not the pool', async () => {
+    // The control for the test above. If this passed instead of failing, the
+    // drain test would be measuring a site that cannot fail rather than a pool
+    // that stops.
+    const out = join(work('build-drain-one'), 'dist')
+    await assert.rejects(
+      () => build({ site: FAILING_WORKER, dbPath: db, outDir: out, workers: 1, skipAssets: true }),
+      /worker 0 fails on purpose/)
+  })
+
+  test('a build that does not fail still renders every route', async () => {
+    // The negative control that matters most: a drain is trivially achievable by
+    // stopping work early, and this is what says the pool still finishes.
+    const out = join(work('build-drain-ok'), 'dist')
+    const r = await build({ site: BLOG, dbPath: plainDb, outDir: out, workers: 4, skipAssets: true })
+    assert.equal(written(out), r.routes)
   })
 })
 
