@@ -193,9 +193,14 @@ describe('build — the worker pool drains before it reports failure', () => {
       /worker 0 of 4: Error: worker 0 fails on purpose/)
     const atReject = written(out)
     await settle()
+    // The load-bearing one, and it holds however the threads were scheduled: a
+    // pool that leaked would still be rendering through this window.
     assert.equal(written(out), atReject, 'a worker kept writing after the build failed')
-    // Worker 0 fails before any sibling finishes its first page, so a drained
-    // pool leaves the output directory untouched rather than merely stable.
+    // Stronger, and only sound because the fixture orders the failure rather
+    // than merely winning a race to it: no sibling can write until worker 0's
+    // marker exists, and a full burn separates the two. An earlier version of
+    // this assertion was a race, passed locally, and failed on a slower CI
+    // runner with three pages already written.
     assert.equal(atReject, 0)
   })
 
