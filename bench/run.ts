@@ -17,7 +17,14 @@ const smoke = process.argv.includes('--smoke')
 const SIZES = smoke ? [200] : [500, 2000, 8000, 20000]
 // Heavy tier (shiki syntax highlighting) is sampled, not swept — its per-page
 // cost multiplier is what matters and that is size-independent.
-const HEAVY_SIZES = smoke ? [200] : [500, 2000, 8000]
+//
+// 20,000 is in the list even so, and that is not a change of mind about
+// sweeping. The Phase 0 headline figure is the heavy tier at the largest corpus,
+// and RESULTS.md tells a reader to reproduce the table with `npm run gate` --
+// which, while this list stopped at 8,000, ran every row except the one the
+// headline quotes. A documented reproduce command that cannot reproduce the
+// documented result is worse than none: it reads as verified.
+const HEAVY_SIZES = smoke ? [200] : [500, 2000, 8000, 20000]
 const WORKERS = Math.max(2, availableParallelism() - 2)
 
 mkdirSync(WORK, { recursive: true })

@@ -1,0 +1,75 @@
+# The suite as a merge gate rather than a thing someone remembers to run.
+#
+# This repository had 264 tests, 35 mutations and no CI, which means every one of
+# those was evidence about one machine at one moment. The point of this file is
+# not more checking — it is the same checking, enforced.
+#
+# Two Node versions: the minimum `engines` claims, because a claim nobody tests
+# is a guess, and current, because that is what a new contributor will have.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.18.0 is the floor package.json declares. Pinned exactly rather than
+        # `22.x`, because the floor is the thing being tested — `22.x` would
+        # quietly test whatever 22 release is current and prove nothing about it.
+        node: ['22.18.0', '24']
+    name: node ${{ matrix.node }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: type check
+        run: npm run typecheck
+
+      - name: tests
+        run: npm test
+
+      # Vulnerabilities in devDependencies do not ship. Runtime ones do.
+      - name: audit runtime dependencies
+        run: npm audit --omit=dev
+
+  mutate:
+    # Separate job, and not because it is optional. It takes minutes where the
+    # suite takes seconds, and running it beside the tests would make every push
+    # wait on it. A green suite that has never been observed failing has
+    # unmeasured failure behaviour, which is the whole argument for the harness;
+    # it is a gate, just a slower one.
+    runs-on: ubuntu-latest
+    name: mutations
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+          cache: npm
+      - run: npm ci
+
+      # s3-truncated-listing-accepted is excluded by name, not silently. Under
+      # that mutation the S3 listing loop never terminates and outlives the test
+      # that timed out on it, so the run hangs roughly one time in six — on any
+      # commit, including before this arc started. Keeping it in would make red
+      # mean "probably nothing", which is worse than one named gap. The fix is a
+      # bounded listing loop (review finding M2), and this line comes out with it.
+      - name: mutation harness
+        run: npm run test:mutate -- --exclude s3-truncated-listing-accepted

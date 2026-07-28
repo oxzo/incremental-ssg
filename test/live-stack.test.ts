@@ -97,7 +97,7 @@ describe('live stack — Directus', { skip: LIVE ? false : 'set ISSG_LIVE=1 with
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
       })
-    ).json()
+    ).json() as { data: { access_token: string } }
     const auth = { authorization: `Bearer ${login.data.access_token}`, 'content-type': 'application/json' }
 
     const created = await (
@@ -106,7 +106,7 @@ describe('live stack — Directus', { skip: LIVE ? false : 'set ISSG_LIVE=1 with
         headers: auth,
         body: JSON.stringify({ doc_id: `tag-live-probe`, slug: 'tag-live-probe', name: 'probe' }),
       })
-    ).json()
+    ).json() as { data: { date_updated: string | null; date_created: unknown; seq: number } }
     try {
       assert.equal(created.data.date_updated, null, 'date_updated populated on create — the adapter comment is now wrong')
       assert.ok(typeof created.data.date_created === 'string', 'date_created is the only timestamp a create sets')

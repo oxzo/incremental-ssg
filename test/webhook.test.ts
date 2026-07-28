@@ -92,10 +92,11 @@ describe('webhook endpoint', () => {
   test('a valid token is accepted in either header form', async () => {
     const e = await endpoint({ secret: 'sh-secret' })
     try {
-      for (const headers of [
+      const forms: Record<string, string>[] = [
         { 'x-webhook-token': 'sh-secret' },
         { authorization: 'Bearer sh-secret' },
-      ]) {
+      ]
+      for (const headers of forms) {
         const res = await e.post('/webhook', '{}', headers)
         assert.equal(res.status, 202, JSON.stringify(headers))
       }
@@ -107,7 +108,7 @@ describe('webhook endpoint', () => {
   test('a wrong, missing, or truncated token is rejected without triggering', async () => {
     const e = await endpoint({ secret: 'sh-secret' })
     try {
-      for (const headers of [
+      const forms: Record<string, string>[] = [
         {},
         { 'x-webhook-token': 'wrong' },
         // A prefix must not pass: a length check that short-circuits before
@@ -115,7 +116,8 @@ describe('webhook endpoint', () => {
         { 'x-webhook-token': 'sh-secre' },
         { 'x-webhook-token': 'sh-secretx' },
         { authorization: 'Bearer nope' },
-      ]) {
+      ]
+      for (const headers of forms) {
         const res = await e.post('/webhook', '{}', headers)
         assert.equal(res.status, 401, JSON.stringify(headers))
         const body = await res.json() as { error: string }

@@ -444,21 +444,26 @@ describe('sync interrupted mid-write', () => {
   test('a sync killed after its first page leaves the marker set and the watermark behind', async () => {
     const docs = blogDocs({ posts: 8 })
     const dbPath = fresh()
-    let child: ChildProcess | null = null
+    // A holder rather than a bare `let`. The CMS handler has to be able to kill
+    // a child that does not exist yet -- the child needs the CMS's url -- and a
+    // variable only ever assigned inside a callback is one the checker
+    // reasonably concludes is still null everywhere else.
+    const proc: { child: ChildProcess | null } = { child: null }
     let killed = false
     const cms = await oneThenHang(docs, () => {
       killed = true
       // SIGKILL, not SIGTERM: the point is a writer that stops existing, with no
       // opportunity to close the database or run a handler.
-      child?.kill('SIGKILL')
+      proc.child?.kill('SIGKILL')
     })
 
     try {
       const exit = await new Promise<number | null>((resolve, reject) => {
-        child = spawn(
+        const child = spawn(
           process.execPath,
           ['--no-warnings', CRASHER, cms.url, dbPath, '4'],
           { stdio: ['ignore', 'pipe', 'inherit'] })
+        proc.child = child
         let out = ''
         child.stdout!.on('data', (b) => { out += String(b) })
         child.on('error', reject)
@@ -483,7 +488,7 @@ describe('sync interrupted mid-write', () => {
         store.close()
       }
     } finally {
-      child?.kill('SIGKILL')
+      proc.child?.kill('SIGKILL')
       await cms.close()
     }
   })

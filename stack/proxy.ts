@@ -212,14 +212,16 @@ export async function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       const headers: Record<string, string> = { 'content-type': 'application/json' }
       if (cfg.retryAfterSec !== undefined) headers['retry-after'] = String(cfg.retryAfterSec)
       res.writeHead(429, headers)
-      return res.end(JSON.stringify({ errors: [{ message: 'injected rate limit' }] }))
+      res.end(JSON.stringify({ errors: [{ message: 'injected rate limit' }] }))
+      return
     }
 
     if (faultable && every(cfg.failEvery, n)) {
       failed++
       emit({ event: 'proxy.500', path, n })
       res.writeHead(500, { 'content-type': 'application/json' })
-      return res.end(JSON.stringify({ errors: [{ message: 'injected server error' }] }))
+      res.end(JSON.stringify({ errors: [{ message: 'injected server error' }] }))
+      return
     }
 
     // Read the client body before forwarding. Buffering rather than streaming
@@ -235,7 +237,8 @@ export async function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
     } catch (e) {
       emit({ event: 'proxy.upstream-error', path, error: String(e) })
       res.writeHead(502, { 'content-type': 'application/json' })
-      return res.end(JSON.stringify({ errors: [{ message: 'proxy upstream unreachable' }] }))
+      res.end(JSON.stringify({ errors: [{ message: 'proxy upstream unreachable' }] }))
+      return
     }
 
     let out = upstream.body
@@ -272,7 +275,8 @@ export async function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       emit({ event: 'proxy.abort', path, n })
       res.writeHead(upstream.status, headers)
       res.write(out.subarray(0, Math.floor(out.length / 2)))
-      return res.socket?.destroy()
+      res.socket?.destroy()
+      return
     }
 
     res.writeHead(upstream.status, { ...headers, 'content-length': String(out.length) })

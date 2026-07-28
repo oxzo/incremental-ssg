@@ -16,6 +16,7 @@
 // respects would not be a lock -- the collision worth preventing is an operator
 // running `build` by hand while a scheduled publish is mid-render.
 import { parseArgs } from 'node:util'
+import type { ParseArgsConfig } from 'node:util'
 import { dirname, resolve } from 'node:path'
 import { httpCmsAdapter } from './cms.ts'
 import { DocumentStore } from './store.ts'
@@ -224,19 +225,42 @@ const die = (e: unknown): never => {
 const command = process.argv[2]
 const argv = process.argv.slice(3)
 
+type ParseOptions = NonNullable<ParseArgsConfig['options']>
+
+/**
+ * parseArgs, with the two things a person typing a command expects of it.
+ *
+ * `build --help` used to exit on an unhandled ERR_PARSE_ARGS_UNKNOWN_OPTION and
+ * a stack trace -- the tool answering a request for help by reporting the
+ * request as a defect, in the least readable form available. Any mistyped flag
+ * did the same. Both now print the usage and exit through `fail`, which is what
+ * every other refusal in this file already does.
+ *
+ * Per-command help would be better than reprinting all of it, and the usage text
+ * is one string today. Reprinting it is still strictly better than a stack.
+ */
+function parse<T extends ParseOptions>(options: T) {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(USAGE)
+    process.exit(0)
+  }
+  try {
+    return parseArgs({ args: argv, options }).values
+  } catch (e) {
+    return fail(e instanceof Error ? e.message : String(e))
+  }
+}
+
 if (command === 'sync') {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
+  const values = parse({
       site: { type: 'string' },
-      db: { type: 'string' },
-      cms: { type: 'string' },
-      'page-size': { type: 'string' },
-      full: { type: 'boolean' },
-      'no-reconcile': { type: 'boolean' },
-      'no-delta': { type: 'boolean' },
-      'no-id-listing': { type: 'boolean' },
-    },
+    db: { type: 'string' },
+    cms: { type: 'string' },
+    'page-size': { type: 'string' },
+    full: { type: 'boolean' },
+    'no-reconcile': { type: 'boolean' },
+    'no-delta': { type: 'boolean' },
+    'no-id-listing': { type: 'boolean' },
   })
   const dbPath = resolve(need(values.db, 'db'))
   const baseUrl = need(values.cms, 'cms')
@@ -264,17 +288,14 @@ if (command === 'sync') {
     store.close()
   }
 } else if (command === 'build') {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
+  const values = parse({
       site: { type: 'string' },
-      db: { type: 'string' },
-      out: { type: 'string' },
-      workers: { type: 'string' },
-      clean: { type: 'boolean' },
-      'skip-assets': { type: 'boolean' },
-      'force-unlock': { type: 'boolean' },
-    },
+    db: { type: 'string' },
+    out: { type: 'string' },
+    workers: { type: 'string' },
+    clean: { type: 'boolean' },
+    'skip-assets': { type: 'boolean' },
+    'force-unlock': { type: 'boolean' },
   })
   const dbPath = resolve(need(values.db, 'db'))
   const r = await withLock(dirname(dbPath), { label: 'cli build', force: values['force-unlock'] }, () =>
@@ -299,21 +320,18 @@ if (command === 'sync') {
       (r.assets.gc.deleted > 0 ? `, ${r.assets.gc.deleted} collected` : ''))
   }
 } else if (command === 'deploy') {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
+  const values = parse({
       out: { type: 'string' },
-      to: { type: 'string' },
-      db: { type: 'string' },
-      'work-dir': { type: 'string' },
-      'dry-run': { type: 'boolean' },
-      force: { type: 'boolean' },
-      'max-delete-ratio': { type: 'string' },
-      'purge-added': { type: 'boolean' },
-      'no-digests': { type: 'boolean' },
-      concurrency: { type: 'string' },
-      'force-unlock': { type: 'boolean' },
-    },
+    to: { type: 'string' },
+    db: { type: 'string' },
+    'work-dir': { type: 'string' },
+    'dry-run': { type: 'boolean' },
+    force: { type: 'boolean' },
+    'max-delete-ratio': { type: 'string' },
+    'purge-added': { type: 'boolean' },
+    'no-digests': { type: 'boolean' },
+    concurrency: { type: 'string' },
+    'force-unlock': { type: 'boolean' },
   })
   const outDir = resolve(need(values.out, 'out'))
   // The seal lives beside the database by default, because that is where build
@@ -360,32 +378,29 @@ if (command === 'sync') {
     if (p.deleted.length > 10) console.log(`  - … and ${p.deleted.length - 10} more`)
   }
 } else if (command === 'serve') {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
+  const values = parse({
       site: { type: 'string' },
-      db: { type: 'string' },
-      out: { type: 'string' },
-      cms: { type: 'string' },
-      to: { type: 'string' },
-      'work-dir': { type: 'string' },
-      port: { type: 'string' },
-      host: { type: 'string' },
-      path: { type: 'string' },
-      secret: { type: 'string' },
-      'hmac-secret': { type: 'string' },
-      'allow-unauthenticated': { type: 'boolean' },
-      debounce: { type: 'string' },
-      'max-delay': { type: 'string' },
-      poll: { type: 'string' },
-      workers: { type: 'string' },
-      'page-size': { type: 'string' },
-      'build-on-start': { type: 'boolean' },
-      'dry-run': { type: 'boolean' },
-      'max-delete-ratio': { type: 'string' },
-      'purge-added': { type: 'boolean' },
-      'force-unlock': { type: 'boolean' },
-    },
+    db: { type: 'string' },
+    out: { type: 'string' },
+    cms: { type: 'string' },
+    to: { type: 'string' },
+    'work-dir': { type: 'string' },
+    port: { type: 'string' },
+    host: { type: 'string' },
+    path: { type: 'string' },
+    secret: { type: 'string' },
+    'hmac-secret': { type: 'string' },
+    'allow-unauthenticated': { type: 'boolean' },
+    debounce: { type: 'string' },
+    'max-delay': { type: 'string' },
+    poll: { type: 'string' },
+    workers: { type: 'string' },
+    'page-size': { type: 'string' },
+    'build-on-start': { type: 'boolean' },
+    'dry-run': { type: 'boolean' },
+    'max-delete-ratio': { type: 'string' },
+    'purge-added': { type: 'boolean' },
+    'force-unlock': { type: 'boolean' },
   })
   const site = resolve(need(values.site, 'site'))
   const dbPath = resolve(need(values.db, 'db'))

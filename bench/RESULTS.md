@@ -5,6 +5,15 @@ Run 2026-07-27. Reproduce with `npm run gate` (writes `.bench/`, gitignored).
 **Machine:** 12-core, NVMe/btrfs, Node 22.22.3, 10 workers. Output written to real
 disk, not tmpfs. Each figure is the faster of two consecutive runs.
 
+> **Method caveat, added 2026-07-28.** Best-of-two is a weaker method than the
+> interleaved runs used from the Phase 2 re-benchmark onward, and it flatters
+> whichever run met the friendlier machine. The table is left as the record of
+> what Phase 0 measured rather than rewritten; the figures to quote are the
+> re-benchmarked ones below. Separately, `npm run gate` did not until today run
+> the 20,000-post *heavy* row this section headlines — it swept every other row,
+> so the command reproduced the table apart from its headline. Fixed in
+> `bench/run.ts`; the reproduce instruction above is now true as written.
+
 **Corpus:** synthetic, deterministic (seed 7). Posts carry ~900 words of markdown
 with headings, a TypeScript code block, a list, a quote, and internal links.
 Routes = post pages + paginated archive (20/page) + 40 tag archives + author

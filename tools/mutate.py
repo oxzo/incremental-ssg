@@ -384,10 +384,26 @@ def run(mutation: Mutation) -> tuple[bool, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--filter", default="")
+    # Named exclusions, for a mutation known to be unreliable for a reason that
+    # is not the line it targets. Used by CI for s3-truncated-listing-accepted:
+    # the mutated listing loop never terminates and outlives the test that gave
+    # up on it, so the run hangs about one time in six on any commit. Excluding
+    # it keeps a red CI meaning something; the fix is the bounded listing loop,
+    # not a longer timeout here.
+    ap.add_argument("--exclude", default="", help="comma-separated mutation ids to skip")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
 
-    selected = [m for m in MUTATIONS if args.filter in m.id]
+    skip = {x.strip() for x in args.exclude.split(",") if x.strip()}
+    unknown = skip - {m.id for m in MUTATIONS}
+    if unknown:
+        # A typo'd exclusion silently excludes nothing, which is the failure mode
+        # where CI looks stricter than it is.
+        print(f"unknown --exclude id(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+        return 2
+    selected = [m for m in MUTATIONS if args.filter in m.id and m.id not in skip]
+    if skip:
+        print(f"skipping {len(skip)} mutation(s) by name: {', '.join(sorted(skip))}\n")
     if args.list:
         for m in selected:
             print(f"{m.id:34s} {m.path:24s} {m.why}")

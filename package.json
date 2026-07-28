@@ -3,11 +3,13 @@
   "private": true,
   "type": "module",
   "version": "0.0.0",
+  "license": "MIT",
   "engines": {
     "node": ">=22.18.0"
   },
   "scripts": {
     "test": "node --no-warnings --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p demo/worker/tsconfig.json",
     "test:mutate": "python3 tools/mutate.py",
     "demo": "node --no-warnings example/blog/demo.ts",
     "stack:up": "bash stack/up.sh",
@@ -29,5 +31,10 @@
     "markdown-it": "^14.1.0",
     "sharp": "^0.35.3",
     "shiki": "^1.24.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
   }
 }

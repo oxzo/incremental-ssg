@@ -1,0 +1,37 @@
+{
+  // Type checking only -- nothing here emits. Node runs the .ts files directly
+  // by stripping types, so the compiler's job in this project is to answer a
+  // question nobody was asking before: are the annotations true? Without it they
+  // are decoration that the runtime discards unread, which is a strange amount
+  // of writing to leave unverified.
+  //
+  // `demo/worker` is excluded and has its own config: it targets the Cloudflare
+  // Workers runtime, whose globals are not Node's, and checking it against
+  // @types/node would be checking it against the wrong world.
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // The two that keep the checker honest about how this code actually runs.
+    // Node's type stripping erases annotations and refuses anything that would
+    // need emitting -- enums, parameter properties, namespaces -- so the
+    // compiler is told to refuse them too rather than accepting code the runtime
+    // will not start.
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "example/**/*.ts", "bench/**/*.ts", "stack/**/*.ts"]
+}

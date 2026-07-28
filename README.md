@@ -74,6 +74,30 @@ prove the seam holds.
 A site is loaded **by path** rather than by value because render workers cannot
 be handed a closure; each thread imports the module itself.
 
+## The content trust model
+
+**CMS content is trusted, and templates are not escaped for you.** Two specific
+consequences, written down because both are reasonable defaults and neither is
+guessable from the code:
+
+- `ctx.md()` runs markdown-it with `html: true`, so raw HTML in a document body
+  reaches the page verbatim. That is correct for an editor you already trust with
+  the site's templates, and it is stored XSS the moment a contributor you do not
+  is allowed to publish.
+- Templates are string functions. `ctx.esc()` exists and is not applied for you,
+  so interpolating a document field without it is the same hazard by a different
+  route.
+
+The assumption behind both is a single-editor CMS whose authors could change the
+templates anyway, which is the setup this project was built against. If that is
+not your setup, the change is small — construct the renderer with `html: false`
+in `src/render.ts`, or sanitize in `ctx.md()` — and the decision is yours to make
+deliberately rather than to inherit.
+
+Route paths are *not* trusted, and are validated: a slug containing `..` cannot
+write outside the output directory, and two routes cannot silently write one
+file. See `planOutputs` in `src/render.ts`.
+
 ## Properties that are tested, not asserted in prose
 
 - **Two builds of one corpus are byte-identical.** Success criterion 1 stated as
@@ -158,8 +182,11 @@ existing path and **says so** (`digestsUnavailable`) rather than reporting them
 unchanged — same principle as the sync driver refusing to pretend it can detect
 deletes without an id listing.
 
-No real host adapter exists yet. `src/deploy-mock.ts` is a directory standing in
-for the live site, the same call this project already made for the CMS.
+Two targets exist: `src/deploy-s3.ts` speaks the S3 API and reaches MinIO
+locally and Cloudflare R2 in the public demo, and `src/deploy-mock.ts` is a
+directory standing in for the live site — which is not a lesser option kept for
+tests, but how a deploy is rehearsed against something that cannot damage
+anything.
 
 **Measured at scale** (23,441 routes, 320 MB; full table in `bench/RESULTS.md`):
 hashing the output tree costs **0.68s** at ~470 MB/s and is the dominant term; a
@@ -343,6 +370,30 @@ object reads as modified on every deploy, forever.
 | `stack/` | the local Directus + MinIO stack, its seeding, and the fault proxy |
 | `tools/mutate.py` | breaks each rail in turn and checks that a test notices |
 | `bench/` | Phase 0 / 2b / 2c / adapter / fan-out harnesses and `RESULTS.md` |
+| `.github/workflows/ci.yml` | the checks below, enforced on push |
+
+## Checks
+
+```sh
+npm test           # 264 tests
+npm run typecheck  # tsc, strict, no emit — Node strips types and checks nothing
+npm run test:mutate  # break each rail in turn; every one must fail a test
+npm audit --omit=dev
+```
+
+`typecheck` covers two projects: the root, and `demo/worker` against the
+Cloudflare runtime whose globals are not Node's.
+
+CI runs all four on the Node version `engines` declares as the floor and on
+current. The mutation harness is a separate job because it takes minutes rather
+than seconds, and it excludes `s3-truncated-listing-accepted` by name — under
+that mutation the S3 listing loop never terminates and the run hangs about one
+time in six, so keeping it in would make a red run mean nothing. The fix is a
+bounded listing loop, and the exclusion comes out with it.
+
+## License
+
+MIT. See `LICENSE`.
 
 ## Not built
 

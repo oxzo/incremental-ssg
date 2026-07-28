@@ -12,8 +12,30 @@
 // everything in this bucket is already meant to be public, because it is a
 // static site.
 
+/**
+ * The three members of an R2 object this Worker touches, declared here rather
+ * than pulled from @cloudflare/workers-types.
+ *
+ * Not a preference. test/demo-worker.test.ts imports `keysFor` and
+ * `cacheControl` from this file to check the path mapping under Node, so the
+ * file is type-checked in two worlds: the Workers runtime, where R2Bucket is
+ * ambient, and the Node project, where it is not and where loading the Workers
+ * globals would collide with Node's own Request/Response/fetch. A structural
+ * declaration of exactly what is used satisfies both and overstates neither --
+ * and if R2's shape drifts, `wrangler deploy` type-checks against the real ones.
+ */
+export interface R2ObjectBody {
+  body: ReadableStream
+  httpEtag: string
+  writeHttpMetadata(headers: Headers): void
+}
+
+export interface SiteBucket {
+  get(key: string): Promise<R2ObjectBody | null>
+}
+
 export interface Env {
-  SITE: R2Bucket
+  SITE: SiteBucket
 }
 
 /**

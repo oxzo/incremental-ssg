@@ -1,0 +1,26 @@
+{
+  // The Worker, checked against the runtime it actually runs in.
+  //
+  // Separate from the root config because the two worlds disagree about the
+  // global scope: @cloudflare/workers-types and @types/node both define fetch,
+  // Request, Response and Headers, and loading them together produces conflicts
+  // that say nothing about either. The root project checks this file too --
+  // test/demo-worker.test.ts imports its path-mapping functions and runs them
+  // under Node -- which is why src/index.ts declares the R2 surface it uses
+  // structurally instead of relying on an ambient type only one of the two
+  // configs can see.
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}

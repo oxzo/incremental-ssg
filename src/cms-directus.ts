@@ -112,7 +112,11 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
       // trying them looks busy while publishing nothing.
       throw new RailError('cms.auth', true, `login failed: ${res.status} ${res.statusText}`)
     }
-    const body = await res.json()
+    // The shape is stated rather than assumed. res.json() is `unknown`, and
+    // reaching through it unchecked is how a login that succeeds with an
+    // unexpected envelope yields an empty token and a confusing failure two
+    // stages later.
+    const body = (await res.json()) as { data?: { access_token?: string } } | null
     token = body?.data?.access_token ?? ''
     if (token === '') throw new RailError('cms.auth', true, 'login returned no access token')
   }
