@@ -645,3 +645,47 @@ you it is bimodal. Sample the distribution, or measure the mechanism.
 Transferable form: **fan-out is a property of the template set, not of the
 content model.** A template that embeds one document into many pages creates a
 hot minority that no average over documents will reveal.
+
+
+## What the content-bound build seal costs (2026-07-28)
+
+Reproduce with `npm run bench:seal -- <posts> <light|heavy>`; the table is
+`20000 light` and `20000 heavy`. Same machine, three interleaved rounds per
+configuration, median reported. Assets skipped, so this is the HTML tree only.
+
+The seal used to record file count and total size — one stat per file, no reads.
+Binding it to *contents* means reading back every byte the build just wrote, and
+the question was whether that price is worth paying on the critical path.
+
+| tier | files | bytes | build | seal | share | read throughput |
+|---|---:|---:|---:|---:|---:|---:|
+| light (plain markdown) | 23,027 | 106 MiB | 2.60s | 0.54s | **21.0%** | 194 MiB/s |
+| heavy (syntax highlighting) | 23,027 | 164 MiB | 9.66s | 0.58s | **6.0%** | 283 MiB/s |
+
+**The absolute cost is flat and the share is not.** ~0.55s either way — it is a
+read over the same tree — against a build that is four times longer on the tier
+this project headlines. So the honest single number is *6% of the configuration
+the ~9.6s figure describes, and 21% of a light one*, and quoting either alone
+picks the answer.
+
+**The estimate this replaced was half right.** The plan for this change projected
+~7% from the Phase 2 deploy-hash measurement (0.68s over 320 MB, ~470 MB/s). The
+share was right for the heavy tier and wrong for the light one, and the
+throughput was wrong for both: this tree averages ~7 KiB per file across 23,027
+files, so per-file open and read dominate and 470 MB/s never appears. **A
+bandwidth figure measured on a tree with large image derivatives does not
+transfer to a tree of small HTML files** — same operation, different bottleneck.
+
+**Accumulating digests during the write was rejected, and not on cost.** It would
+be nearly free: both the render and the asset stage already hold each file's
+bytes. It was refused because it changes what the seal *means*. Read from disk,
+the seal says "this is what is in the tree". Accumulated while writing, it says
+"this is what we meant to put there" — and the gap between those two is precisely
+where the failures it exists to catch live: a truncated write, a file another
+process replaced, a partial flush. A seal that cannot disagree with the writer
+that produced it is not evidence about the tree.
+
+**Method note.** The first run of this benchmark reported the two tiers as
+costing the same, because the corpus was generated without `code: true` and the
+heavy tier had nothing to highlight. `example/blog/fixture.ts` documents that
+trap on the option itself; it still caught the person who had just read it.

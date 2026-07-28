@@ -23,14 +23,24 @@
 //    production. Same rail shape as those two, third occurrence.
 import { readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { join, extname } from 'node:path'
-import { hashTree, statTree } from './hash-tree.ts'
+import { scanTree, foldDigests } from './hash-tree.ts'
 import { pool } from './pool.ts'
 import { RailError, checkNumber } from './rails.ts'
 import type { TreeDigests } from './hash-tree.ts'
 
 /** Bumped when a change here makes an existing seal file unreadable. */
-export const SEAL_SCHEMA = 1
+export const SEAL_SCHEMA = 2
 export const SEAL_FILE = 'build-seal.json'
+
+/**
+ * The seal's digest algorithm, fixed rather than taken from the target.
+ *
+ * A build writes its seal without knowing which target will consume it -- and
+ * the same tree may be deployed to two. Binding the seal to whatever a
+ * particular target's listing happens to report would make the proof a property
+ * of the destination.
+ */
+export const SEAL_ALGORITHM = 'sha256'
 
 /**
  * Proof that a build ran to completion and emitted exactly this tree.
@@ -46,6 +56,17 @@ export type BuildSeal = {
   routes: number
   files: number
   bytes: number
+  /**
+   * What the tree contained: every path and the content under it, folded to one
+   * value (see foldDigests).
+   *
+   * `files` and `bytes` were what this seal used to bind, and they are kept for
+   * reporting only. As a check they proved a tree had not been *truncated* and
+   * proved nothing about its contents, so any post-build edit that preserved the
+   * total size passed validation and was published -- which made "proof that a
+   * build emitted exactly this tree", above, a claim the seal did not support.
+   */
+  digest: string
   /**
    * The build emptied outDir first, so the tree is a pure function of content
    * plus code. See the third rail in deploy() for why this is not cosmetic.
@@ -321,22 +342,37 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
       `forever, silently. Rebuild with clean output (--clean, or {clean:true}), or ` +
       `override with --force / {force:true} if you know this tree is complete.`)
   }
-  const actual = statTree(outDir)
-  if (actual.files !== seal.files || actual.bytes !== seal.bytes) {
+  // One walk, and the diff needed it anyway. The target's algorithm is what the
+  // remote listing reports (md5 for S3-style ETags); the seal's is always
+  // sha256. When they differ both are computed from the same buffer rather than
+  // reading 320 MB twice.
+  const th = now()
+  const algorithms =
+    target.digestAlgorithm === SEAL_ALGORITHM
+      ? [SEAL_ALGORITHM]
+      : [target.digestAlgorithm, SEAL_ALGORITHM]
+  const scan = scanTree(outDir, algorithms)
+  const local = scan.digests[0]
+  const sealed = algorithms.length === 1 ? scan.digests[0] : scan.digests[1]
+  const hashMs = now() - th
+
+  const actual = foldDigests(sealed)
+  if (actual !== seal.digest) {
     // Transient: something mutated the tree after the build, and a clean rebuild
     // re-establishes agreement between tree and seal.
+    //
+    // The counts in this message are diagnostic, not the test. They used to be
+    // the test, which is why a same-size edit -- one character swapped in a
+    // published page -- passed here and was deployed.
     throw new RailError(
       'deploy-tree-mismatch',
       false,
-      `deploy() output tree does not match its seal: ${actual.files} files / ` +
-      `${actual.bytes} bytes on disk against ${seal.files} / ${seal.bytes} sealed. ` +
+      `deploy() output tree does not match its seal: ${scan.files} files / ` +
+      `${scan.bytes} bytes on disk against ${seal.files} / ${seal.bytes} sealed, ` +
+      `and content digest ${actual.slice(0, 16)} against ${seal.digest.slice(0, 16)}. ` +
       `Something changed or removed build output after the build completed; ` +
       `re-run the build rather than deploying a tree nothing vouches for.`)
   }
-
-  const th = now()
-  const local = hashTree(outDir, target.digestAlgorithm)
-  const hashMs = now() - th
 
   const tl = now()
   const remote = await target.list()

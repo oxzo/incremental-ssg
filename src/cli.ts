@@ -291,7 +291,7 @@ if (command === 'sync') {
     `${(r.bytes / 1024 / 1024).toFixed(1)} MiB, ${r.workers} workers, ${ms(r.ms.total)}`)
   console.log(
     `  load ${ms(r.ms.load)}  index ${ms(r.ms.index)}  routes ${ms(r.ms.routes)}  ` +
-    `assets ${ms(r.ms.assets)}  render ${ms(r.ms.render)}`)
+    `assets ${ms(r.ms.assets)}  render ${ms(r.ms.render)}  seal ${ms(r.ms.seal)}`)
   if (r.assets) {
     console.log(
       `  assets: ${r.assets.sources} sources, ${r.assets.stats.hits} cached, ` +

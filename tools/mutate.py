@@ -252,6 +252,31 @@ MUTATIONS: list[Mutation] = [
         "the original defect: a typo in a numeric flag reaches the rails as NaN instead of being refused",
         "test/numeric-guards.test.ts",
     ),
+    # --- the build seal, and what it binds ------------------------------------
+    Mutation(
+        "seal-binds-only-size",
+        "src/deploy.ts",
+        "  if (actual !== seal.digest) {",
+        "  if (scan.files !== seal.files || scan.bytes !== seal.bytes) {",
+        "the shape this replaced: any post-build edit preserving the total size validates and is published",
+        "test/deploy.test.ts",
+    ),
+    Mutation(
+        "seal-fold-ignores-paths",
+        "src/hash-tree.ts",
+        "    h.update(`${Buffer.byteLength(rel)}:${rel}${Buffer.byteLength(hash)}:${hash}`)",
+        "    h.update(`${Buffer.byteLength(hash)}:${hash}`)",
+        "a tree holding the same bytes under different names would fold to the same seal value",
+        "test/deploy.test.ts",
+    ),
+    Mutation(
+        "seal-fold-order-dependent",
+        "src/hash-tree.ts",
+        "  const entries = [...digests].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))",
+        "  const entries = [...digests]",
+        "a seal that depends on walk order is a seal that disagrees with itself when the filesystem reorders",
+        "test/deploy.test.ts",
+    ),
     # --- content type transitions ---------------------------------------------
     Mutation(
         "sync-type-not-in-identity",

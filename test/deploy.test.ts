@@ -3,9 +3,9 @@ import assert from 'node:assert/strict'
 import { copyFileSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { build } from '../src/build.ts'
-import { deploy, planDeploy, clearSeal, contentTypeFor } from '../src/deploy.ts'
+import { deploy, planDeploy, clearSeal, contentTypeFor, readSeal, SEAL_SCHEMA } from '../src/deploy.ts'
 import { directoryTarget } from '../src/deploy-mock.ts'
-import { hashTree } from '../src/hash-tree.ts'
+import { hashTree, scanTree, foldDigests } from '../src/hash-tree.ts'
 import { tmpdir, cleanup, seedStore, blogDocs, makeImages, EPOCH } from './fixture.ts'
 import type { MockDoc } from '../src/cms-mock.ts'
 
@@ -287,6 +287,83 @@ describe('deploy — rails', () => {
       /does not match its seal/)
   })
 
+  test('refuses a same-size edit to the built tree, which the old seal passed', async () => {
+    // The case that made "proof that a build emitted exactly this tree" untrue.
+    // The seal recorded file count and total bytes, so an edit preserving both
+    // -- one character swapped in a published page -- validated cleanly and was
+    // uploaded. Nothing downstream could catch it either: the diff would see a
+    // changed file and dutifully publish the tampered version.
+    const s = await site(blogDocs({ posts: 10 }))
+    const seal = (await s.build()).seal
+
+    const victim = join(s.outDir, 'index.html')
+    const before = readFileSync(victim)
+    const after = Buffer.from(before)
+    // Same length, different content, and deliberately a byte that would render.
+    after[after.indexOf(0x3e)] = 0x20
+    writeFileSync(victim, after)
+    assert.equal(after.length, before.length, 'the edit must not change the size')
+
+    await assert.rejects(
+      () => deploy({ outDir: s.outDir, target: directoryTarget({ dir: s.remoteDir }), seal }),
+      (e: unknown) => {
+        assert.match((e as Error).message, /does not match its seal/)
+        assert.match((e as Error).message, /content digest/)
+        return true
+      })
+
+    // And the counts really do still agree, so the digest is what refused --
+    // not the file/byte totals wearing a new message.
+    assert.equal(scanTree(s.outDir, ['sha256']).files, seal.files)
+    assert.equal(scanTree(s.outDir, ['sha256']).bytes, seal.bytes)
+  })
+
+  test('the same tree untouched still deploys, so the check is about content', async () => {
+    // The control for the test above.
+    const s = await site(blogDocs({ posts: 10 }))
+    const seal = (await s.build()).seal
+    const r = await deploy({ outDir: s.outDir, target: directoryTarget({ dir: s.remoteDir }), seal })
+    assert.ok(r.uploaded > 0)
+  })
+
+  test('two files swapping content are refused, though every byte is still present', async () => {
+    // Paths are folded in with their digests, so a tree holding exactly the same
+    // multiset of bytes under different names is a different tree. Count, total
+    // size and even the set of content hashes are unchanged here.
+    const s = await site(blogDocs({ posts: 10 }))
+    const seal = (await s.build()).seal
+    const a = join(s.outDir, 'posts', 'post-1', 'index.html')
+    const b = join(s.outDir, 'posts', 'post-2', 'index.html')
+    const [ba, bb] = [readFileSync(a), readFileSync(b)]
+    writeFileSync(a, bb)
+    writeFileSync(b, ba)
+    await assert.rejects(
+      () => deploy({ outDir: s.outDir, target: directoryTarget({ dir: s.remoteDir }), seal }),
+      /does not match its seal/)
+  })
+
+  test('the seal verifies against a target whose listing reports a different algorithm', async () => {
+    // The deploy hashes local files with the *target's* algorithm so the diff is
+    // comparable to its listing -- md5 for S3-style ETags -- while the seal is
+    // always sha256. Both come out of one read of the tree; this checks the
+    // wiring, since getting it wrong would either compare md5 to a sha256 seal
+    // (every deploy refuses) or read 320 MB twice.
+    const s = await site(blogDocs({ posts: 8 }))
+    const seal = (await s.build()).seal
+    const target = directoryTarget({ dir: s.remoteDir, digestAlgorithm: 'md5' })
+    const r = await deploy({ outDir: s.outDir, target, seal })
+    assert.ok(r.uploaded > 0)
+
+    // And it still refuses a tampered tree through that same path.
+    const victim = join(s.outDir, 'index.html')
+    const body = readFileSync(victim)
+    body[body.indexOf(0x3e)] = 0x20
+    writeFileSync(victim, body)
+    await assert.rejects(
+      () => deploy({ outDir: s.outDir, target: directoryTarget({ dir: s.remoteDir, digestAlgorithm: 'md5' }), seal }),
+      /does not match its seal/)
+  })
+
   test('refuses a seal describing a different output directory', async () => {
     const a = await site(blogDocs({ posts: 6 }))
     const b = await site(blogDocs({ posts: 6 }))
@@ -357,6 +434,76 @@ describe('deploy — rails', () => {
     const seal = (await small.build()).seal
     const r = await deploy({ outDir: small.outDir, target, seal, maxDeleteRatio: 0.99 })
     assert.ok(r.deleted > 0)
+  })
+})
+
+describe('foldDigests', () => {
+  const m = (...pairs: [string, string][]) => new Map(pairs)
+
+  test('does not depend on the order the tree was walked in', () => {
+    // Insertion order follows the filesystem walk, which is stable today and is
+    // not something the seal should depend on.
+    assert.equal(
+      foldDigests(m(['a.html', 'h1'], ['b.html', 'h2'])),
+      foldDigests(m(['b.html', 'h2'], ['a.html', 'h1'])))
+  })
+
+  test('changes when content changes', () => {
+    assert.notEqual(foldDigests(m(['a.html', 'h1'])), foldDigests(m(['a.html', 'h2'])))
+  })
+
+  test('changes when a path changes, though the content does not', () => {
+    // The reason paths are folded in at all: a tree holding the same bytes under
+    // different names is a different site.
+    assert.notEqual(foldDigests(m(['a.html', 'h1'])), foldDigests(m(['b.html', 'h1'])))
+  })
+
+  test('no two trees fold to one value, whatever a path contains', () => {
+    // This test failed when written, against a fold that joined `path hash`
+    // lines with newlines: the two maps below serialise to identical bytes, so
+    // one seal value stood for two different trees. Length-prefixing is what
+    // makes the encoding unambiguous rather than unambiguous-so-long-as-no-path-
+    // contains-a-separator.
+    assert.notEqual(
+      foldDigests(m(['a', 'h1'], ['b', 'h2'])),
+      foldDigests(m(['a h1\nb', 'h2'])))
+    // The same question asked of the other separator, and of a path that ends
+    // where another begins.
+    assert.notEqual(
+      foldDigests(m(['a', 'h1'], ['b', 'h2'])),
+      foldDigests(m(['a', 'h1b'], ['', 'h2'])))
+    assert.notEqual(
+      foldDigests(m(['ab', 'h1'])),
+      foldDigests(m(['a', 'bh1'])))
+  })
+
+  test('an empty tree folds to a stable value that is not any non-empty one', () => {
+    assert.equal(foldDigests(m()), foldDigests(m()))
+    assert.notEqual(foldDigests(m()), foldDigests(m(['a.html', 'h1'])))
+  })
+})
+
+describe('the seal schema', () => {
+  test('a seal from before the digest existed is not readable', async () => {
+    // The bump is load-bearing rather than bookkeeping: a schema-1 seal has no
+    // digest field, so reading it as current would compare the tree against
+    // `undefined` and refuse every deploy -- or, written the other way round,
+    // silently skip the check. Neither is a thing to leave to chance.
+    const s = await site(blogDocs({ posts: 4 }))
+    await s.build()
+    const sealPath = join(s.workDir, 'build-seal.json')
+    const current = JSON.parse(readFileSync(sealPath, 'utf8'))
+    assert.equal(current.schema, SEAL_SCHEMA)
+    assert.equal(typeof current.digest, 'string')
+
+    const { digest, ...old } = current
+    writeFileSync(sealPath, JSON.stringify({ ...old, schema: 1 }))
+    assert.equal(readSeal(s.workDir), null)
+    await assert.rejects(
+      () => deploy({
+        outDir: s.outDir, target: directoryTarget({ dir: s.remoteDir }), workDir: s.workDir,
+      }),
+      /no build seal/)
   })
 })
 

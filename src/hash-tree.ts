@@ -43,13 +43,74 @@ function walk(dir: string, visit: (abs: string, rel: string) => void) {
   rec(dir)
 }
 
+export type TreeScan = {
+  files: number
+  bytes: number
+  /** One digest map per requested algorithm, in the order they were asked for. */
+  digests: TreeDigests[]
+}
+
+/**
+ * Everything a caller can learn from reading the tree, in one pass over it.
+ *
+ * Multiple algorithms because the deploy needs two and the bytes should only be
+ * read once. The diff compares against whatever the target's listing reports --
+ * md5, for S3-style ETags -- while the build seal is always sha256, because the
+ * build writes the seal without knowing which target will consume it. Hashing
+ * the same buffer twice is CPU on bytes already in hand; walking the tree twice
+ * is a second full read.
+ *
+ * `bytes` comes from the buffer rather than a stat, which also removes the
+ * second syscall per file that the old stat-only walk paid.
+ */
+export function scanTree(dir: string, algorithms: string[]): TreeScan {
+  const digests: TreeDigests[] = algorithms.map(() => new Map())
+  let files = 0
+  let bytes = 0
+  walk(dir, (abs, rel) => {
+    const body = readFileSync(abs)
+    files++
+    bytes += body.byteLength
+    for (let i = 0; i < algorithms.length; i++) {
+      digests[i].set(rel, createHash(algorithms[i]).update(body).digest('hex'))
+    }
+  })
+  return { files, bytes, digests }
+}
+
 /** Content digest of every file in the tree. Reads every byte. */
 export function hashTree(dir: string, algorithm = 'sha256'): TreeDigests {
-  const out: TreeDigests = new Map()
-  walk(dir, (abs, rel) => {
-    out.set(rel, createHash(algorithm).update(readFileSync(abs)).digest('hex'))
-  })
-  return out
+  return scanTree(dir, [algorithm]).digests[0]
+}
+
+/**
+ * One value standing for a whole tree: which files exist, and what is in them.
+ *
+ * Folded from a digest map the caller already has, so proving a tree matches
+ * costs no extra read. Paths are included and the lines are sorted, so a file
+ * renamed to another with identical content changes the value, and the walk
+ * order does not.
+ *
+ * This is what the build seal binds. Before it, the seal recorded file count and
+ * total size -- which proves a tree was not truncated and proves nothing about
+ * its contents, so any same-size edit after the build passed validation and was
+ * published.
+ */
+export function foldDigests(digests: TreeDigests): string {
+  const entries = [...digests].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const h = createHash('sha256')
+  for (const [rel, hash] of entries) {
+    // Length-prefixed, not separator-joined. The first version of this folded
+    // `${rel} ${hash}\n` lines, and a test written to ask whether two trees
+    // could produce one value answered yes: {"a": "h1", "b": "h2"} and
+    // {"a h1\nb": "h2"} serialise to identical bytes. Contrived as a filename
+    // and not contrived as a property -- the whole point of a seal is that one
+    // value stands for exactly one tree, and a separator only holds while no
+    // path contains it. Byte lengths rather than string lengths because update()
+    // writes UTF-8 and `.length` counts UTF-16 units.
+    h.update(`${Buffer.byteLength(rel)}:${rel}${Buffer.byteLength(hash)}:${hash}`)
+  }
+  return h.digest('hex')
 }
 
 /**
@@ -65,20 +126,9 @@ export function fingerprint(dir: string, algorithm = 'sha256'): string[] {
   return [...hashTree(dir, algorithm)].map(([rel, hash]) => `${rel} ${hash}`).sort()
 }
 
-/**
- * File count and total size, reading no content.
- *
- * The cheap half of hashing, used by the build seal: it costs one stat per file
- * (tens of milliseconds at 24k routes) and still binds the seal to the actual
- * size of what was emitted, so a truncated or half-written tree does not pass
- * for a complete one.
- */
-export function statTree(dir: string): { files: number; bytes: number } {
-  let files = 0
-  let bytes = 0
-  walk(dir, (abs) => {
-    files++
-    bytes += statSync(abs).size
-  })
-  return { files, bytes }
-}
+// `statTree` used to live here: file count and total size, reading no content.
+// It was the cheap half of hashing, and it was what the build seal bound -- one
+// stat per file, no reads, and no evidence about what any of those bytes were.
+// Gone with the seal that needed it. Both callers now take the full scan, and
+// keeping a stat-only walk beside it would be a second answer to "what is in
+// this tree" that nothing checks against the first.

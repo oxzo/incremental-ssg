@@ -19,8 +19,8 @@ import { loadSite } from './config.ts'
 import { runAssetStage, emptyManifest } from './assets.ts'
 import { createContextFactory, createRenderer, renderRoute, writeFile, planOutputs } from './render.ts'
 import { beginDeterministicWindow } from './determinism.ts'
-import { clearSeal, writeSeal, SEAL_SCHEMA } from './deploy.ts'
-import { statTree } from './hash-tree.ts'
+import { clearSeal, writeSeal, SEAL_SCHEMA, SEAL_ALGORITHM } from './deploy.ts'
+import { scanTree, foldDigests } from './hash-tree.ts'
 import { checkNumber } from './rails.ts'
 import type { Route, SiteConfig } from './config.ts'
 import type { AssetManifest, AssetStageResult } from './assets.ts'
@@ -53,7 +53,12 @@ export type BuildResult = {
   assets: AssetStageResult | null
   /** Proof this build finished, and the deploy diff's precondition. */
   seal: BuildSeal
-  ms: { load: number; index: number; routes: number; assets: number; render: number; total: number }
+  ms: {
+    load: number; index: number; routes: number; assets: number; render: number
+    /** Reading the emitted tree back to bind the seal to its contents. */
+    seal: number
+    total: number
+  }
 }
 
 export type Resolved = {
@@ -347,16 +352,23 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   // totals because assets are hardlinked into the output too, and the seal has
   // to describe the whole emitted tree -- that is what lets the deploy notice a
   // tree that lost files after the build rather than during it.
-  const tree = statTree(outDir)
+  // Reads every emitted byte, which the old stat-only walk did not. That is the
+  // price of a seal that describes contents instead of dimensions, and it is
+  // reported as its own timing (ms.seal) rather than folded into the total --
+  // a cost nobody can see is a cost nobody can decide about.
+  const ts = now()
+  const scan = scanTree(outDir, [SEAL_ALGORITHM])
   const seal: BuildSeal = {
     schema: SEAL_SCHEMA,
     site: cfgProbe.name,
     outDir,
     routes,
-    files: tree.files,
-    bytes: tree.bytes,
+    files: scan.files,
+    bytes: scan.bytes,
+    digest: foldDigests(scan.digests[0]),
     clean: opts.clean === true,
   }
+  const sealMs = now() - ts
   writeSeal(workDir, seal)
 
   return {
@@ -373,6 +385,7 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
       routes: resolveMs.routes,
       assets: assetMs,
       render: renderMs,
+      seal: sealMs,
       total: now() - t0,
     },
   }

@@ -21,7 +21,8 @@
     "bench:sync-assets": "node --no-warnings bench/run-2b.ts",
     "bench:asset-cache": "node --no-warnings bench/run-2c.ts",
     "bench:phase2": "node --no-warnings bench/run-2.ts",
-    "bench:seam": "node --no-warnings bench/run-2-seam.ts"
+    "bench:seam": "node --no-warnings bench/run-2-seam.ts",
+    "bench:seal": "node --no-warnings bench/run-seal.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1096.0",
