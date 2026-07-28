@@ -76,11 +76,10 @@ jobs:
           cache: npm
       - run: npm ci
 
-      # s3-truncated-listing-accepted is excluded by name, not silently. Under
-      # that mutation the S3 listing loop never terminates and outlives the test
-      # that timed out on it, so the run hangs roughly one time in six — on any
-      # commit, including before this arc started. Keeping it in would make red
-      # mean "probably nothing", which is worse than one named gap. The fix is a
-      # bounded listing loop (review finding M2), and this line comes out with it.
+      # Every mutation, no exclusions. s3-truncated-listing-accepted was excluded
+      # here by name until the listing loop got a request cap: under it the loop
+      # never terminated, outlived the test that timed out on it, and hung the
+      # run about one time in six. The cap bounds the mutated loop as well as the
+      # real one, which is most of what it is for.
       - name: mutation harness
-        run: npm run test:mutate -- --exclude s3-truncated-listing-accepted
+        run: npm run test:mutate

@@ -44,6 +44,14 @@ export type FaultConfig = {
    * makes a naive pagination loop exit and report a short listing as complete.
    */
   stripContinuationToken?: boolean
+  /**
+   * Replace every continuation token with one fixed value, so the client keeps
+   * asking for a page it has already been given. The shape that makes a
+   * pagination loop that only checks for a *missing* token run forever: every
+   * response is well-formed, truncated, and carries a token, and none of them
+   * advances.
+   */
+  pinContinuationToken?: boolean
   /** Apply faults only to requests whose path matches. */
   only?: RegExp
 }
@@ -60,7 +68,14 @@ export type RunningProxy = {
   url: string
   port: number
   /** Requests seen, and how many of each fault fired. */
-  stats: () => { requests: number; rateLimited: number; failed: number; aborted: number; truncated: number }
+  stats: () => {
+    requests: number
+    rateLimited: number
+    failed: number
+    aborted: number
+    truncated: number
+    pinned: number
+  }
   /** Change the faults without restarting -- this is how a sweep varies RTT. */
   configure: (next: FaultConfig) => void
   close: () => Promise<void>
@@ -166,6 +181,7 @@ export async function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   let failed = 0
   let aborted = 0
   let truncated = 0
+  let pinned = 0
 
   const emit = (event: Record<string, unknown>) => opts.onEvent?.(event)
   const every = (n: number | undefined, count: number) => n !== undefined && n > 0 && count % n === 0
@@ -267,6 +283,24 @@ export async function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
       }
     }
 
+    // Pinned rather than removed, and the difference is the whole fault: a
+    // client that treats "the token is gone" as the only broken pagination
+    // handles the strip above and loops forever on this one.
+    if (faultable && cfg.pinContinuationToken) {
+      const text = out.toString('utf8')
+      if (text.includes('<NextContinuationToken>')) {
+        pinned++
+        emit({ event: 'proxy.pinned-continuation', path })
+        out = Buffer.from(
+          text.replace(
+            /<NextContinuationToken>[\s\S]*?<\/NextContinuationToken>/,
+            '<NextContinuationToken>pinned</NextContinuationToken>',
+          ),
+          'utf8',
+        )
+      }
+    }
+
     // Half the response, then the socket dies. This is the shape that a naive
     // client reports as a parse error and a careless one reports as success
     // with a short body.
@@ -290,7 +324,7 @@ export async function startProxy(opts: ProxyOptions): Promise<RunningProxy> {
   return {
     url: `http://127.0.0.1:${port}`,
     port,
-    stats: () => ({ requests, rateLimited, failed, aborted, truncated }),
+    stats: () => ({ requests, rateLimited, failed, aborted, truncated, pinned }),
     configure: (next: FaultConfig) => {
       cfg = { ...cfg, ...next }
     },

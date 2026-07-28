@@ -14,7 +14,7 @@ import {
   PutObjectCommand,
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3'
-import { RailError } from './rails.ts'
+import { RailError, checkNumber } from './rails.ts'
 import type { DeployTarget, RemoteObject } from './deploy.ts'
 
 export type S3TargetOptions = {
@@ -34,6 +34,19 @@ export type S3TargetOptions = {
   forcePathStyle?: boolean
   /** Objects per listing request. The API caps this at 1000. */
   pageSize?: number
+  /**
+   * How many requests one listing may send before it is refused.
+   *
+   * A ceiling on the loop, not on the bucket. At the API's maximum page size the
+   * default permits ten million objects -- some four hundred times the largest
+   * tree this project has ever built (23,027 files, `bench/RESULTS.md`) -- so it
+   * cannot plausibly fire on a real listing, which is the property that lets it
+   * be a hard refusal rather than a warning.
+   *
+   * It scales with pageSize, since the bound is on requests: at 100 objects per
+   * request the same default permits a million objects rather than ten.
+   */
+  maxListRequests?: number
   /** Recorded no-op purges, for tests and reporting. */
   onPurge?: (paths: string[]) => void
 }
@@ -67,6 +80,11 @@ export function s3DeployTarget(opts: S3TargetOptions): DeployTarget {
   const key = (path: string) => (prefix === '' ? path : `${prefix}/${path}`)
   const unkey = (k: string) => (prefix === '' ? k : k.slice(prefix.length + 1))
   const pageSize = Math.min(opts.pageSize ?? 1000, 1000)
+  const maxListRequests = checkNumber(opts.maxListRequests, 10_000, {
+    name: 'maxListRequests',
+    min: 1,
+    integer: true,
+  })
 
   const client = new S3Client({
     region: opts.region ?? 'us-east-1',
@@ -102,12 +120,41 @@ export function s3DeployTarget(opts: S3TargetOptions): DeployTarget {
      * That is why a truncated response is followed rather than trusted, and why
      * a missing continuation token on a truncated page is a refusal rather than
      * a loop-exit.
+     *
+     * Following a listing to its end also means trusting the server to end it,
+     * and the two refusals below are what happens when it does not. They are
+     * ordered by how much they know: a token arriving a second time is a repeat
+     * and is named as one, and everything else that keeps the loop running is
+     * caught by the request cap.
      */
     async list(): Promise<RemoteObject[]> {
       const out: RemoteObject[] = []
+      // Every token the server has issued, not only the last one, so a cycle of
+      // any length is caught rather than just an immediate repeat. Affordable
+      // because maxListRequests bounds how many there can be.
+      const issued = new Set<string>()
       let token: string | undefined
-      for (;;) {
-        const before = out.length
+      for (let requests = 0; ; requests++) {
+        // Checked before the request, and deliberately the one rail here that
+        // depends on nothing else being right. Every other check in this loop
+        // decides whether to *continue*, so a bug in any of them is not a wrong
+        // answer -- it is a deploy that never starts, which this project's notes
+        // already name as worse than a crash.
+        //
+        // tools/mutate.py needs it for the same reason from the other side:
+        // without a bound that survives them, breaking any one of these checks
+        // hangs the harness instead of failing a test, and a hang is the one
+        // result that says nothing about which line caused it.
+        if (requests === maxListRequests) {
+          throw new RailError(
+            'deploy.listing',
+            false,
+            `bucket listing did not end within ${maxListRequests} requests (${out.length} objects so far). ` +
+            `Not terminal, because this rail cannot tell a bucket that really is this large from a listing ` +
+            `that is looping, and it sits where only the second is plausible — raise maxListRequests if the ` +
+            `first is what happened.`,
+          )
+        }
         const res = await client.send(
           new ListObjectsV2Command({
             Bucket: opts.bucket,
@@ -125,18 +172,6 @@ export function s3DeployTarget(opts: S3TargetOptions): DeployTarget {
           out.push({ path: unkey(o.Key), digest: usableDigest(o.ETag) })
         }
         if (!res.IsTruncated) break
-        // A truncated page that added nothing means the loop is not making
-        // progress, and the next iteration will send the identical request. Left
-        // alone that is not a slow listing, it is a deploy that never starts --
-        // so it is refused rather than spun on. Checked before the token, because
-        // a repeated token produces this shape without ever being undefined.
-        if (out.length === before) {
-          throw new RailError(
-            'deploy.listing',
-            false,
-            `bucket listing made no progress after ${out.length} objects — the continuation token is not advancing`,
-          )
-        }
         token = res.NextContinuationToken
         if (token === undefined) {
           throw new RailError(
@@ -145,6 +180,27 @@ export function s3DeployTarget(opts: S3TargetOptions): DeployTarget {
             `bucket listing reported truncated with no continuation token after ${out.length} objects`,
           )
         }
+        // A token the server has already issued means the next request is one it
+        // has already answered, so the listing is repeating rather than
+        // advancing. This is the exact form of "not making progress"; counting
+        // objects *retained* per page is not, because the filter above can drop
+        // every key on a page -- a page of directory markers does exactly that
+        // -- while the listing itself advances normally.
+        //
+        // Not terminal: this is the server's pagination misbehaving, not a fact
+        // about what is in the bucket, so the next attempt can list correctly. A
+        // server that does it every time surfaces through the service's
+        // consecutive-failure count, which has evidence across attempts that a
+        // single throw site does not.
+        if (issued.has(token)) {
+          throw new RailError(
+            'deploy.listing',
+            false,
+            `bucket listing re-issued a continuation token it had already given, after ${out.length} objects ` +
+            `— the listing is repeating rather than advancing`,
+          )
+        }
+        issued.add(token)
       }
       return out
     },

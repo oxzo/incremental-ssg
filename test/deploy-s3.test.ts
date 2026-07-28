@@ -127,6 +127,13 @@ describe('s3 target — listing', () => {
 
   // Timed out rather than left open: the failure mode this guards against is a
   // listing loop that never terminates, and an untimed test for it would hang.
+  //
+  // maxListRequests is set here for the harness rather than for the assertion.
+  // Removing the refusal below sends the loop back to page one forever, and a
+  // timeout does not stop the loop -- the mutation outlives the test and the run
+  // hangs instead of failing, which is how this mutation earned a CI exclusion
+  // before the cap existed. With the cap it stops after four requests and fails
+  // the matcher, which is a result.
   test('refuses a truncated flag with no continuation token instead of stopping early', { timeout: 10_000 }, async () => {
     const objects = Array.from({ length: 30 }, (_, i) => obj(`${String(i).padStart(3, '0')}.html`, `b${i}`))
     const fake = track(await startFakeS3({ objects }))
@@ -135,10 +142,70 @@ describe('s3 target — listing', () => {
     // which is a mass delete on the next deploy.
     const proxy = track(await startProxy({ origin: fake.url, stripContinuationToken: true }))
     await assert.rejects(
-      () => targetFor(proxy.url, { pageSize: 10 }).list(),
-      (e: unknown) => e instanceof RailError && /continuation token|no progress/.test((e as Error).message),
+      () => targetFor(proxy.url, { pageSize: 10, maxListRequests: 4 }).list(),
+      (e: unknown) => e instanceof RailError && /no continuation token/.test((e as Error).message),
     )
     assert.equal(proxy.stats().truncated, 1, 'the fault actually fired')
+  })
+
+  /**
+   * A token that comes back a second time is the loop not advancing, and it is
+   * invisible to the check above: every response is well-formed, truncated, and
+   * carries a token. Nothing in the loop exits, and the object count keeps
+   * climbing on duplicates, so a "did this page add anything" rule does not see
+   * it either.
+   */
+  test('refuses a continuation token the server has already issued', async () => {
+    const objects = Array.from({ length: 40 }, (_, i) => obj(`${String(i).padStart(3, '0')}.html`, `b${i}`))
+    const fake = track(await startFakeS3({ objects }))
+    const proxy = track(await startProxy({ origin: fake.url, pinContinuationToken: true }))
+    await assert.rejects(
+      () => targetFor(proxy.url, { pageSize: 10, maxListRequests: 20 }).list(),
+      (e: unknown) => e instanceof RailError && !e.terminal && /already given/.test((e as Error).message),
+    )
+    assert.ok(proxy.stats().pinned > 0, 'the fault actually fired')
+    // Two requests, not twenty. The repeat is refused by name rather than by the
+    // cap eventually noticing, which is the difference between a message that
+    // says what happened and one that says how long it went on.
+    assert.equal(fake.requests().filter((r) => r.query['list-type'] === '2').length, 2)
+  })
+
+  /**
+   * The bound that holds when the other two do not.
+   *
+   * The cap is set *below* what an honest listing needs, so removing it makes
+   * this test complete rather than hang. A test for a loop bound that can only
+   * fail by running forever cannot report the bound's absence -- tools/mutate.py
+   * reads that as no result, which is the state this whole item came out of.
+   */
+  test('refuses a listing that outruns the request cap instead of following it forever', async () => {
+    const objects = Array.from({ length: 250 }, (_, i) => obj(`p/${String(i).padStart(4, '0')}.html`, `b${i}`))
+    const fake = track(await startFakeS3({ objects }))
+    await assert.rejects(
+      () => targetFor(fake.url, { pageSize: 10, maxListRequests: 5 }).list(),
+      (e: unknown) =>
+        e instanceof RailError && !e.terminal && /did not end within 5 requests/.test((e as Error).message),
+    )
+    const lists = fake.requests().filter((r) => r.query['list-type'] === '2')
+    assert.equal(lists.length, 5, 'it stopped at the cap rather than somewhere past it')
+  })
+
+  /**
+   * The negative control for the refusals above: a page can retain nothing and
+   * still be a listing that is advancing normally.
+   *
+   * The rule this replaced refused a truncated page that added no objects, which
+   * reads as "the token is not advancing" and is not the same statement -- the
+   * directory markers filtered out above are keys the server returned. A bucket
+   * whose first page is all markers is a listing this deploy must follow, not
+   * one it may refuse.
+   */
+  test('follows a page that retains nothing, because filtered keys are still progress', async () => {
+    const markers = Array.from({ length: 10 }, (_, i) => obj(`${String(i).padStart(3, '0')}/`, ''))
+    const files = Array.from({ length: 10 }, (_, i) => obj(`1${String(i).padStart(2, '0')}.html`, `b${i}`))
+    const fake = track(await startFakeS3({ objects: [...markers, ...files] }))
+    const listed = await targetFor(fake.url, { pageSize: 10 }).list()
+    assert.deepEqual(listed.map((o) => o.path), files.map((o) => o.key))
   })
 })
 

@@ -140,6 +140,41 @@ MUTATIONS: list[Mutation] = [
         "exiting on a missing continuation token reports a short listing as complete",
         "test/deploy-s3.test.ts",
     ),
+    # The three mutations below are why the listing loop has a request cap. The
+    # first two break a check that decides whether to *continue*, so without a
+    # bound that outlives them the harness gets a hang rather than a failure --
+    # which is what s3-truncated-listing-accepted did for the whole of Tier A,
+    # and why CI excluded it by name. Each of these three now stops in single
+    # digits of requests.
+    Mutation(
+        "s3-repeated-token-accepted",
+        "src/deploy-s3.ts",
+        "        if (issued.has(token)) {",
+        "        if (false) {",
+        "a token the server re-issues asks for a page it has already answered, and nothing else in the loop can see it",
+        "test/deploy-s3.test.ts",
+    ),
+    Mutation(
+        "s3-listing-unbounded",
+        "src/deploy-s3.ts",
+        "        if (requests === maxListRequests) {",
+        "        if (false) {",
+        "the only bound in the listing loop that does not depend on another check in it being right",
+        "test/deploy-s3.test.ts",
+    ),
+    # The classification, not the check. The cap is the one refusal here whose
+    # terminal bit is a judgement rather than a reading: it cannot tell a bucket
+    # that really is that large (terminal in fact) from a listing that is looping
+    # (transient), so the choice between them is pinned by a test rather than
+    # left to whoever edits the line next.
+    Mutation(
+        "s3-listing-cap-terminal",
+        "src/deploy-s3.ts",
+        "            false,\n            `bucket listing did not end within",
+        "            true,\n            `bucket listing did not end within",
+        "a service that halts on this waits for a human over what is most likely a server's bad minute",
+        "test/deploy-s3.test.ts",
+    ),
     Mutation(
         "s3-delete-errors-ignored",
         "src/deploy-s3.ts",
@@ -385,11 +420,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--filter", default="")
     # Named exclusions, for a mutation known to be unreliable for a reason that
-    # is not the line it targets. Used by CI for s3-truncated-listing-accepted:
-    # the mutated listing loop never terminates and outlives the test that gave
-    # up on it, so the run hangs about one time in six on any commit. Excluding
-    # it keeps a red CI meaning something; the fix is the bounded listing loop,
-    # not a longer timeout here.
+    # is not the line it targets. Nothing uses it as of the bounded listing loop
+    # -- s3-truncated-listing-accepted was the one exclusion, CI carried it for
+    # the mutated loop's non-termination, and the cap retired it.
+    #
+    # Kept rather than removed with its user, because the next mutation of this
+    # shape wants a named gap and a comment over either a silent skip or a red
+    # run that means nothing. It rejects an id matching nothing, so an exclusion
+    # that has stopped applying fails loudly instead of quietly excluding
+    # nothing.
     ap.add_argument("--exclude", default="", help="comma-separated mutation ids to skip")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()

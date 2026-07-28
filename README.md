@@ -375,7 +375,7 @@ object reads as modified on every deploy, forever.
 ## Checks
 
 ```sh
-npm test           # 264 tests
+npm test           # 267 tests
 npm run typecheck  # tsc, strict, no emit — Node strips types and checks nothing
 npm run test:mutate  # break each rail in turn; every one must fail a test
 npm audit --omit=dev
@@ -390,10 +390,12 @@ npm ci --prefix demo/worker && npm run typecheck:worker
 
 CI runs all four on the Node version `engines` declares as the floor and on
 current. The mutation harness is a separate job because it takes minutes rather
-than seconds, and it excludes `s3-truncated-listing-accepted` by name — under
-that mutation the S3 listing loop never terminates and the run hangs about one
-time in six, so keeping it in would make a red run mean nothing. The fix is a
-bounded listing loop, and the exclusion comes out with it.
+than seconds, and it now runs every mutation. It excluded
+`s3-truncated-listing-accepted` by name for a while — under that mutation the S3
+listing loop never terminated, outlived the test that timed out on it, and hung
+the run about one time in six. Bounding the listing loop at a request count
+fixed the mutation as well as the code: a check that decides whether to
+*continue* cannot be broken safely unless something outside it stops the loop.
 
 ## License
 
