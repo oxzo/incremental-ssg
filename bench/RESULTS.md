@@ -594,3 +594,54 @@ provider's rate limiter under sustained load, replica lag between a write and th
 read that follows it, a listing API that caps or charges differently, credential
 rotation mid-sync, and the tail of a real network. Injected faults are the faults
 that were anticipated, and anticipated faults are the ones already handled.
+
+---
+
+# Fan-out is a property of the template set (2026-07-28)
+
+Found by running the service against the real stack for the first time: a single
+title edit published **408 files of 2,322**. Every one of them genuinely
+contained the edited title, so the deploy diff was correct — the expectation was
+wrong. Phase 0's table predicts 8. Reproduce with
+`npm run bench:fanout-templates`.
+
+**Cause: the example site's related-posts sidebar.** `related` takes the first
+`RELATED` entries from the post's *first tag's* list, which is sorted
+newest-first. So the newest few posts in each tag appear on the page of every
+post sharing that tag, and every other post appears on almost nothing. Fan-out is
+**bimodal**, and which mode an edit lands in depends on which post is edited.
+
+| | 500 posts (587 routes) | 2,000 posts (2,310 routes) |
+|---|---:|---:|
+| minimum | 6 | 6 |
+| **median** | **8 (1.4%)** | **8 (0.3%)** |
+| **maximum** | **223 (38.0%)** | **835 (36.1%)** |
+| samples in the expensive mode | 8 of 24 | 8 of 24 |
+
+**The cheap mode is constant and the expensive mode is proportional.** 8 routes
+at both scales, exactly as Phase 0 found; 223 → 835 for a 4× corpus, holding at
+roughly 36–38% of the site. The expensive mode is approximately "the number of
+posts sharing a tag", which grows with the corpus by construction.
+
+**The live run corroborates the benchmark.** The service published 408 of 2,322
+for `post-7`; this benchmark measures `post-6` at 411 and `post-8` at 445, on a
+corpus generated with different body settings. Two independent paths to the same
+neighbourhood.
+
+**The Phase 0 gate is untouched.** It rests on a full rebuild being fast enough,
+and it is — 2,310 routes rebuilt and diffed in 1.6s through the live service.
+What needs qualifying is the *fan-out table*: "content edits are constant-cost,
+5–9 routes at any scale" is true of the harness templates, and true of the median
+edit here, and false for the newest posts in each tag.
+
+**The methodology note is the part worth keeping.** The first version of this
+benchmark edited one post, reported 9 routes, and would have "refuted" the
+observed 408. That is the same error Phase 0's notes already record about its own
+first fan-out model — which appended text to the end of a body, left the excerpt
+untouched, and reported the best case as if it were typical. **A bimodal quantity
+has no meaningful single sample**, and nothing about editing one document tells
+you it is bimodal. Sample the distribution, or measure the mechanism.
+
+Transferable form: **fan-out is a property of the template set, not of the
+content model.** A template that embeds one document into many pages creates a
+hot minority that no average over documents will reveal.

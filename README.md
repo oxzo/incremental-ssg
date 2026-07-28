@@ -298,6 +298,9 @@ silently breaks the obvious implementation:
   different payload shapes across create, update and delete. A flow written the
   obvious way works for updates and sends nothing at all for creates.
 
+The CLI selects both by scheme — `--cms directus+http://host`, `--to s3://bucket`
+— with credentials read from the environment only, never a flag.
+
 On the deploy side the S3 target uses `@aws-sdk/client-s3`, so the same code
 points at S3 or R2 by changing an endpoint and a credential pair. The one
 non-obvious rule: a **multipart ETag is not the MD5 of the object**, so it is
@@ -328,7 +331,7 @@ object reads as modified on every deploy, forever.
 | `example/blog/` | the example site, its sample corpus, and `demo.ts` |
 | `stack/` | the local Directus + MinIO stack, its seeding, and the fault proxy |
 | `tools/mutate.py` | breaks each rail in turn and checks that a test notices |
-| `bench/` | Phase 0 / 2b / 2c / adapter harnesses and `RESULTS.md` |
+| `bench/` | Phase 0 / 2b / 2c / adapter / fan-out harnesses and `RESULTS.md` |
 
 ## Not built
 

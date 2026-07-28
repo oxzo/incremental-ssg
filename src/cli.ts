@@ -23,6 +23,8 @@ import { sync } from './sync.ts'
 import { build } from './build.ts'
 import { deploy } from './deploy.ts'
 import { directoryTarget } from './deploy-mock.ts'
+import { directusCmsAdapter } from './cms-directus.ts'
+import { s3DeployTarget } from './deploy-s3.ts'
 import { loadSite } from './config.ts'
 import { withLock } from './build-lock.ts'
 import { createPipeline, createService, jsonLog } from './service.ts'
@@ -57,9 +59,20 @@ Notes
 
   deploy requires a build that ran with --clean, because nothing removes
   output an earlier build left behind and a stale page reads as unchanged.
-  --to names a local directory standing in for the live site: no real host
-  adapter exists yet, the same way the CMS is still a mock behind its
-  interface. --dry-run prints the plan without touching the target.
+  --dry-run prints the plan without touching the target.
+
+  --cms selects the adapter by scheme:
+    http://host            the mock/generic cursor-paginated JSON API
+    directus+http://host   a real Directus; needs DIRECTUS_COLLECTIONS and
+                           either DIRECTUS_TOKEN or DIRECTUS_EMAIL+PASSWORD
+  --to likewise:
+    <dir>                  a local directory standing in for the live site,
+                           which is how a deploy is rehearsed against something
+                           that cannot damage anything
+    s3://bucket[/prefix]   real object storage; needs S3_ACCESS_KEY_ID and
+                           S3_SECRET_ACCESS_KEY, plus S3_ENDPOINT for MinIO/R2
+  Credentials come from the environment only. A secret passed as a flag is
+  visible to every user on the box via ps for the life of the process.
   --no-digests simulates a target that cannot report content hashes, which
   degrades the diff to a full upload rather than to silence.
 
@@ -87,6 +100,73 @@ const fail = (msg: string): never => {
 
 const ms = (n: number) => `${n.toFixed(0)}ms`
 const need = (v: string | undefined, flag: string) => v ?? fail(`--${flag} is required`)
+
+/**
+ * Pick a CMS adapter from --cms.
+ *
+ * The scheme selects the implementation, so one flag names both which service
+ * and where it is. `directus+http://host` rather than a separate --cms-kind:
+ * a URL and a kind that disagree is a class of misconfiguration that cannot be
+ * expressed if there is only one string.
+ *
+ * Credentials come from the environment only, never a flag -- a secret on the
+ * command line is visible to every user on the box via ps, for the whole life of
+ * a long-running service.
+ */
+function cmsAdapterFrom(spec: string, opts: { deltaSync?: boolean; idListing?: boolean } = {}) {
+  if (spec.startsWith('directus+')) {
+    const baseUrl = spec.slice('directus+'.length)
+    const collections = (process.env.DIRECTUS_COLLECTIONS ?? '')
+      .split(',')
+      .map((c) => c.trim())
+      .filter(Boolean)
+    if (collections.length === 0) {
+      fail('DIRECTUS_COLLECTIONS must list the collections to sync, comma-separated')
+    }
+    const token = process.env.DIRECTUS_TOKEN
+    const email = process.env.DIRECTUS_EMAIL
+    const password = process.env.DIRECTUS_PASSWORD
+    if (!token && !(email && password)) {
+      fail('set DIRECTUS_TOKEN, or DIRECTUS_EMAIL and DIRECTUS_PASSWORD')
+    }
+    return directusCmsAdapter({ baseUrl, collections, token, email, password })
+  }
+  return httpCmsAdapter({
+    baseUrl: spec,
+    capabilities: { deltaSync: opts.deltaSync ?? true, idListing: opts.idListing ?? true },
+  })
+}
+
+/**
+ * Pick a deploy target from --to: `s3://bucket/prefix`, or a local directory.
+ *
+ * The directory target is not a lesser option kept for tests -- it is how a
+ * deploy is rehearsed against something that cannot damage a live site, which is
+ * why --dry-run and a directory are different tools rather than the same one.
+ */
+function deployTargetFrom(spec: string, opts: { digestListing?: boolean } = {}) {
+  if (spec.startsWith('s3://')) {
+    const [bucket, ...rest] = spec.slice('s3://'.length).split('/')
+    if (!bucket) fail('--to s3://<bucket>[/<prefix>] needs a bucket')
+    const accessKeyId = process.env.S3_ACCESS_KEY_ID
+    const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY
+    if (!accessKeyId || !secretAccessKey) {
+      fail('set S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY')
+    }
+    return s3DeployTarget({
+      bucket,
+      prefix: rest.join('/'),
+      endpoint: process.env.S3_ENDPOINT,
+      region: process.env.S3_REGION,
+      accessKeyId,
+      secretAccessKey,
+    })
+  }
+  return directoryTarget({
+    dir: resolve(spec),
+    capabilities: { digestListing: opts.digestListing ?? true },
+  })
+}
 
 /**
  * Report a refusal as a message, not a stack.
@@ -122,9 +202,9 @@ if (command === 'sync') {
   // has no opinion about the schema.
   const contentTypes = values.site ? (await loadSite(resolve(values.site))).contentTypes : undefined
 
-  const adapter = httpCmsAdapter({
-    baseUrl,
-    capabilities: { deltaSync: !values['no-delta'], idListing: !values['no-id-listing'] },
+  const adapter = cmsAdapterFrom(baseUrl, {
+    deltaSync: !values['no-delta'],
+    idListing: !values['no-id-listing'],
   })
   const store = new DocumentStore(dbPath)
   try {
@@ -202,9 +282,8 @@ if (command === 'sync') {
       ? dirname(resolve(values.db))
       : fail('--work-dir or --db is required, to locate the build seal')
 
-  const target = directoryTarget({
-    dir: resolve(need(values.to, 'to')),
-    capabilities: { digestListing: !values['no-digests'] },
+  const target = deployTargetFrom(need(values.to, 'to'), {
+    digestListing: !values['no-digests'],
   })
   // Under the lock: this reads the seal and every emitted byte, and a build
   // running underneath it would be rewriting both while the diff is computed.
@@ -271,8 +350,8 @@ if (command === 'sync') {
   const outDir = resolve(need(values.out, 'out'))
   const workDir = resolve(values['work-dir'] ?? dirname(dbPath))
 
-  const adapter = httpCmsAdapter({ baseUrl: need(values.cms, 'cms') })
-  const target = directoryTarget({ dir: resolve(need(values.to, 'to')) })
+  const adapter = cmsAdapterFrom(need(values.cms, 'cms'))
+  const target = deployTargetFrom(need(values.to, 'to'))
 
   const pipeline = createPipeline({
     site,
