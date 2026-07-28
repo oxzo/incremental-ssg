@@ -6,10 +6,10 @@ import { spawn } from 'node:child_process'
 import { startMockCms } from '../src/cms-mock.ts'
 import { httpCmsAdapter } from '../src/cms.ts'
 import { DocumentStore } from '../src/store.ts'
-import { sync, canonicalJson, SYNC_MUTATING } from '../src/sync.ts'
+import { sync, canonicalJson, SYNC_MUTATING, WATERMARK } from '../src/sync.ts'
 import { tmpdir, cleanup, blogDocs, EPOCH } from './fixture.ts'
 import type { MockDoc } from '../src/cms-mock.ts'
-import type { CmsCapabilities } from '../src/cms.ts'
+import type { CmsCapabilities, CmsDocument } from '../src/cms.ts'
 import type { AddressInfo } from 'node:net'
 import type { ChildProcess } from 'node:child_process'
 
@@ -511,4 +511,135 @@ describe('sync interrupted mid-write', () => {
       await h.close()
     }
   })
+})
+
+// What the CMS says it has, against what it actually sent.
+//
+// Until now the only completeness evidence was `cursor === null`, which is the
+// CMS agreeing with itself. `seen` feeds deleteMissing, so a listing that comes
+// back short does not merely miss documents -- it presents their absence as
+// deletions, and the ratio ceiling passes anything under half the mirror.
+describe('sync — a listing that came back short', () => {
+  const doc = (id: string): CmsDocument => ({
+    id,
+    type: 'post',
+    revision: `r-${id}`,
+    updatedAt: EPOCH,
+    doc: { id, title: id },
+  })
+
+  /**
+   * An adapter that reports a count and delivers a list, independently.
+   *
+   * Written as a fake rather than driven through the mock HTTP server on
+   * purpose: the rail reads `CmsPage.total`, which is an adapter-contract value,
+   * and a lying HTTP server would test the http adapter's parsing on the way to
+   * testing this. `deltaSync: false` keeps every sync a full pull, which is the
+   * path where `seen` decides what gets deleted.
+   */
+  const counting = (docs: CmsDocument[], total: number | undefined, deliver = docs.length) => ({
+    name: 'counting',
+    capabilities: { deltaSync: false, idListing: true, webhookRevisions: false },
+    async list() {
+      return { items: docs.slice(0, deliver), cursor: null, total }
+    },
+    async listIds() {
+      return docs.map((d) => ({ id: d.id, revision: d.revision }))
+    },
+    revisionOf: () => null,
+    bytesRead: () => 0,
+  })
+
+  const ten = Array.from({ length: 10 }, (_, i) => doc(`d${i}`))
+
+  /** A store already holding all ten, as a previous good sync would have left it. */
+  async function seeded() {
+    const store = new DocumentStore(fresh())
+    await sync(counting(ten, 10), store, { pageSize: 500 })
+    assert.equal(store.identities().size, 10)
+    return store
+  }
+
+  test('is refused before anything is inferred from an absence', async () => {
+    const store = await seeded()
+    try {
+      await assert.rejects(
+        () => sync(counting(ten, 10, 6), store, { pageSize: 500 }),
+        (e: Error) => {
+          assert.match(e.message, /reported 10 documents .* and returned 6/)
+          assert.equal((e as { rail?: string }).rail, 'sync.short-listing')
+          // Transient: a document deleted mid-pull produces exactly this and
+          // resolves itself, so a retry is the remedy rather than a human.
+          assert.equal((e as { terminal?: boolean }).terminal, false)
+          return true
+        })
+      // The four it did not send are still here. That is the whole point: they
+      // exist, and the only evidence they did not was a listing that was short.
+      assert.equal(store.identities().size, 10)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('leaves the watermark where it was, not only the rows', async () => {
+    // Refusing just the delete pass would still advance the watermark past
+    // documents that were never seen -- and `since` is exclusive, so a delta
+    // pull can never ask for them again. Silent and permanent.
+    const store = await seeded()
+    try {
+      const before = store.getMeta(WATERMARK)
+      await assert.rejects(() => sync(counting(ten, 10, 6), store, { pageSize: 500 }))
+      assert.equal(store.getMeta(WATERMARK), before)
+      // And it stays marked, so the service treats the store as dirty and the
+      // upserts that did commit are not stranded.
+      assert.equal(store.getMeta(SYNC_MUTATING), '1')
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a listing that delivers what it promised is not refused', async () => {
+    // The negative control. A rail that refused everything would pass the two
+    // tests above.
+    const store = await seeded()
+    try {
+      const r = await sync(counting(ten, 10), store, { pageSize: 500 })
+      assert.equal(r.pulled, 10)
+      assert.equal(r.deleted, 0)
+      assert.equal(store.identities().size, 10)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('delivering MORE than the count promised is not refused', async () => {
+    // One-sided on purpose: a document created while the pull was running makes
+    // the count an undercount, and that is the CMS behaving correctly. A rail
+    // that fires on correct behaviour costs more trust than the one it saves.
+    const store = await seeded()
+    try {
+      const r = await sync(counting(ten, 8), store, { pageSize: 500 })
+      assert.equal(r.pulled, 10)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('an adapter that reports no count disables the check rather than failing it', async () => {
+    // Absence has to stay distinguishable from zero. An adapter that cannot
+    // count says so by omitting the field, and the old behaviour is what it
+    // gets: the four missing documents are reconciled away as deletes, guarded
+    // only by the ratio ceiling. Stated by a test rather than left to be
+    // discovered, because this is the gap the rail does not close.
+    const store = await seeded()
+    try {
+      const r = await sync(counting(ten, undefined, 6), store, { pageSize: 500 })
+      assert.equal(r.pulled, 6)
+      assert.equal(r.deleted, 4)
+      assert.equal(store.identities().size, 6)
+    } finally {
+      store.close()
+    }
+  })
+
 })

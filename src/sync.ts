@@ -9,12 +9,12 @@
 // adapter will serve, hash everything, and let the store decide what actually
 // changed.
 import { createHash } from 'node:crypto'
-import { checkNumber } from './rails.ts'
+import { checkNumber, RailError } from './rails.ts'
 import type { CmsAdapter, CmsDocument } from './cms.ts'
 import { documentIdentity } from './store.ts'
 import type { DocumentStore, UpsertInput } from './store.ts'
 
-const WATERMARK = 'sync:watermark'
+export const WATERMARK = 'sync:watermark'
 
 /**
  * Set while committed writes exist that the watermark does not yet cover.
@@ -134,6 +134,7 @@ export async function sync(
   let httpMs = 0
   let hashMs = 0
   let storeMs = 0
+  let expected: number | undefined
   const seen = new Set<string>()
 
   // Idempotent, and deliberately not hoisted to the top of the function: the
@@ -203,8 +204,56 @@ export async function sync(
     deleted += store.deleteIds(unwanted)
     storeMs += now() - c
 
+    // The last page's value wins: CmsPage.total is a total for the listing and
+    // not a per-page remainder, so an adapter that learns the count in stages
+    // reports its most complete answer last.
+    expected = page.total
     cursor = page.cursor
     if (cursor === null) break
+  }
+
+  // Did the listing return everything it said it had?
+  //
+  // Until now the only answer was `cursor === null`, which is the CMS agreeing
+  // with itself. `seen` goes straight into deleteMissing below, so a listing
+  // that quietly came back short does not merely miss documents -- it presents
+  // their absence as deletions, and the ratio ceiling waves through anything
+  // under half the mirror.
+  //
+  // One-sided on purpose. Pulling *more* than the count predicted is a document
+  // created while the pull was running, which is the CMS behaving correctly, and
+  // a rail that fires on correct behaviour costs more trust than the one it
+  // saves. Pulling fewer is the hazard.
+  //
+  // Absent total, no check: an adapter that cannot count says so by omitting the
+  // field, and inventing a number for it would refuse real listings.
+  //
+  // `!== undefined` rather than a truthiness test, and it is worth saying that
+  // the two cannot actually differ here: the only falsy total is 0, and `pulled
+  // < 0` is unreachable. Written this way because it matches what the field
+  // means rather than because a case demands it -- and said plainly, since a
+  // test asserting the distinction would be asserting nothing.
+  if (expected !== undefined && pulled < expected) {
+    // Transient, and the classification is the argument: a count disagreeing
+    // with a pull is a fact about one listing at one moment, not about the
+    // content. A document deleted mid-pull produces exactly this and resolves
+    // itself on the next attempt.
+    //
+    // Thrown here, which is before the reconcile *and* before the watermark
+    // write, and it needs to be both. Refusing only the deletes would still let
+    // the watermark advance past documents that were never seen -- and `since`
+    // is exclusive, so the next delta pull cannot ask for them again. That is
+    // the same permanent silent loss the sync:mutating marker exists to prevent,
+    // reached from the other side. The upserts that already committed are kept:
+    // they are positive evidence, and charging evidenced work to a rail guarding
+    // a different doubt is the mistake the delete path already made once.
+    throw new RailError(
+      'sync.short-listing',
+      false,
+      `the CMS reported ${expected} documents matching this sync and returned ${pulled}. ` +
+      `Refused before reconciling: the pulled set is what decides which documents still ` +
+      `exist, so a listing that came back short reads as ${expected - pulled} deletions. ` +
+      `Nothing was removed and the watermark was not advanced; retry.`)
   }
 
   // Deletes. A delta pull cannot return a document that no longer exists, so

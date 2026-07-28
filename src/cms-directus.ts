@@ -262,6 +262,19 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
     }
   }
 
+  // Accumulated across the pages of one listing, to satisfy CmsPage.total.
+  // Directus counts relative to the filter, and the filter carries the keyset
+  // cursor, so a page's own count is the remainder of the *current collection*
+  // and not a total of anything. Only a collection's first page (seq 0) reports
+  // that collection's whole share, so those are the ones summed.
+  //
+  // `countable` is the honest half. A response without a usable filter_count
+  // means this listing cannot be counted, and the answer to that is to report
+  // no total at all -- an absent total disables the check in sync(), a wrong one
+  // refuses a listing that was fine.
+  let expected = 0
+  let countable = true
+
   return {
     name: opts.name ?? 'directus',
     capabilities: { deltaSync: true, idListing: true, webhookRevisions: true },
@@ -275,10 +288,26 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
      * straight into DocumentStore.deleteMissing after a full pull, so a page
      * that drifts because a document was inserted mid-pull does not merely skip
      * that document -- it unpublishes it.
+     *
+     * `meta=filter_count` rides along on the same request. The comment this
+     * replaces declined a count because it would cost "a request per page" --
+     * measured against the live stack, it costs no request at all and +3.1% on
+     * the one already being made (9.1ms -> 9.4ms, 7 interleaved rounds, 2,000
+     * rows, limit 500). Phase 2b's finding was that request count dominates sync
+     * wall time; this adds none.
      */
     async list(o: ListOptions): Promise<CmsPage> {
+      // A listing starts when the caller has no cursor. Resetting here rather
+      // than in a separate call keeps the adapter usable for two syncs in a row
+      // without the second inheriting the first's arithmetic.
+      if (o.cursor === null) {
+        expected = 0
+        countable = true
+      }
       const { index, seq } = parseCursor(o.cursor)
-      if (index >= cols.length) return { items: [], cursor: null }
+      if (index >= cols.length) {
+        return { items: [], cursor: null, total: countable ? expected : undefined }
+      }
       const { collection, type } = cols[index]
 
       const delta = deltaFilter(o.since)
@@ -289,10 +318,21 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
         limit: String(o.limit),
         sort: 'seq',
         filter: JSON.stringify(filter),
+        meta: 'filter_count',
       })
       const body = await request(`/items/${collection}?${qs}`)
       const rows: Row[] = Array.isArray(body?.data) ? body.data : []
       const items = rows.map((r) => toDocument(r, type ?? collection, collection))
+
+      // Counted once per collection, on the page whose keyset bound admits all
+      // of it. Later pages of the same collection report what is left, which is
+      // a different question and would be double-counted as an answer to this
+      // one.
+      if (seq === 0) {
+        const n = Number(body?.meta?.filter_count)
+        if (Number.isFinite(n) && n >= 0) expected += n
+        else countable = false
+      }
 
       // A short page means this collection is exhausted, so the cursor moves to
       // the next one. A full page might be the last -- that costs one empty
@@ -317,7 +357,7 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
           `cursor did not advance past ${cursor} in ${collection} — ${rows.length} rows returned`,
         )
       }
-      return { items, cursor }
+      return { items, cursor, total: countable ? expected : undefined }
     },
 
     /**

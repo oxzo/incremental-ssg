@@ -133,6 +133,37 @@ describe('live stack — Directus', { skip: LIVE ? false : 'set ISSG_LIVE=1 with
     assert.equal(new Set(ids.map((i) => i.id)).size, ids.length, 'duplicate ids in the listing')
     store.close()
   })
+
+  /**
+   * The completeness count, against the thing that has to supply it.
+   *
+   * The fake serves `meta.filter_count` because it was told to. Only the real
+   * instance can say whether Directus still returns it on the same request, and
+   * whether it counts the filter rather than the page -- and if either stopped
+   * being true, the sync-side rail would not fail, it would go quiet: a missing
+   * meta reports no total, and no total disables the check. A rail that
+   * disappears rather than fires is exactly what this tier is for.
+   */
+  test('a real listing reports a count, and the count is what the pull delivers', async () => {
+    const a = adapter()
+    let cursor: string | null = null
+    let pulled = 0
+    let last: number | undefined
+    let pages = 0
+    for (;;) {
+      const page = await a.list({ cursor, limit: 100 })
+      pulled += page.items.length
+      last = page.total
+      cursor = page.cursor
+      pages++
+      if (cursor === null) break
+      if (pages > 500) throw new Error('list() did not terminate')
+    }
+    assert.notEqual(last, undefined, 'Directus stopped returning meta.filter_count — the rail is now inert')
+    assert.ok(pulled > 0, 'the corpus is not empty -- run stack/seed.ts')
+    assert.equal(last, pulled, 'the count and the pull disagree on a quiet corpus')
+    assert.ok(pages > 1, 'a single-page listing cannot show that the count is a total, not a remainder')
+  })
 })
 
 describe('live stack — S3', { skip: LIVE ? false : 'set ISSG_LIVE=1 with stack/up.sh running' }, () => {

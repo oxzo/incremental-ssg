@@ -57,7 +57,17 @@ function matches(row: FakeRow, filter: any): boolean {
 
 export async function startFakeDirectus(
   rows: Map<string, FakeRow[]>,
-  opts: { token?: string; requireAuth?: boolean } = {},
+  opts: {
+    token?: string
+    requireAuth?: boolean
+    /**
+     * Answer `meta=filter_count` with no `meta` at all -- an older Directus, a
+     * proxy that strips it, or a permission that hides it. The adapter has to
+     * report no total in that case rather than a wrong one, and nothing else in
+     * the suite can produce a response shaped like this.
+     */
+    omitMeta?: boolean
+  } = {},
 ): Promise<FakeDirectus> {
   const token = opts.token ?? 'fake-token'
   const seen: { path: string; query: Record<string, string> }[] = []
@@ -87,6 +97,11 @@ export async function startFakeDirectus(
 
     const filter = query.filter ? JSON.parse(query.filter) : null
     let out = list.filter((r) => matches(r, filter))
+    // Counted after the filter and before the limit, which is what a real
+    // Directus does -- verified against the live stack: a 2,000-row collection
+    // answers `filter_count: 1995` under a `seq > 5` filter while returning the
+    // 2 rows the limit asked for.
+    const filterCount = out.length
     out.sort((a, b) => a.seq - b.seq)
     const limit = Number(query.limit ?? '100')
     if (limit >= 0) out = out.slice(0, limit)
@@ -95,6 +110,9 @@ export async function startFakeDirectus(
     if (query.fields) {
       const want = query.fields.split(',')
       out = out.map((r) => Object.fromEntries(want.filter((f) => f in r).map((f) => [f, r[f]])) as FakeRow)
+    }
+    if (query.meta === 'filter_count' && opts.omitMeta !== true) {
+      return json(res, 200, { meta: { filter_count: filterCount }, data: out })
     }
     return json(res, 200, { data: out })
   })

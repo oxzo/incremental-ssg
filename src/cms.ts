@@ -26,6 +26,24 @@ export type CmsPage = {
   items: CmsDocument[]
   /** Opaque continuation token; null when the listing is exhausted. */
   cursor: string | null
+  /**
+   * How many documents this listing yields for this query *in total*, counting
+   * the ones already returned -- or undefined when the adapter cannot say.
+   *
+   * A total, not a remainder, and the distinction is the whole of the contract.
+   * A CMS that paginates by keyset answers "how many match" relative to the
+   * cursor, so the natural reading of its count shrinks with every page; a
+   * driver comparing that against a running pull would be comparing two
+   * different populations and refusing correct syncs. An adapter that can only
+   * see remainders is expected to accumulate into this field rather than pass
+   * one through.
+   *
+   * Optional because it is evidence, not a requirement, and `undefined` has to
+   * stay distinguishable from zero: absence disables the completeness check in
+   * sync(), it does not fail it. An adapter that cannot count says so by
+   * omitting this rather than by guessing, because a guessed total refuses real
+   * listings.
+   */
   total?: number
 }
 

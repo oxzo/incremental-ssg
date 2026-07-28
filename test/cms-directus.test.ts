@@ -331,3 +331,96 @@ describe('directus adapter — configuration', () => {
     )
   })
 })
+
+// The count that lets sync() tell a short listing from a complete one.
+//
+// Directus counts relative to the filter, and the filter carries the keyset
+// cursor, so a page's own filter_count is the remainder of the current
+// collection rather than a total of anything. The adapter has to accumulate --
+// and the reason this is tested at the adapter rather than through sync() is
+// that a per-page number and an accumulated one are indistinguishable on a
+// single-collection, single-page listing, which is what a casual test would use.
+describe('directus adapter — the listing count', () => {
+  /** Drain, keeping each page's reported total. */
+  async function totals(adapter: ReturnType<typeof directusCmsAdapter>, limit: number, since?: number) {
+    let cursor: string | null = null
+    const seen: (number | undefined)[] = []
+    let pulled = 0
+    for (;;) {
+      const page = await adapter.list({ cursor, limit, since })
+      seen.push(page.total)
+      pulled += page.items.length
+      cursor = page.cursor
+      if (cursor === null) break
+      if (seen.length > 200) throw new Error('list() did not terminate')
+    }
+    return { totals: seen, last: seen[seen.length - 1], pulled }
+  }
+
+  test('the final page reports the whole listing, summed across collections', async () => {
+    const fake = track(await startFakeDirectus(fakeRows({ post: 7, tag: 3, page: 1 })))
+    const adapter = adapterFor(fake.url, ['post', 'tag', 'page'])
+    const { last, pulled } = await totals(adapter, 100)
+    assert.equal(pulled, 11)
+    assert.equal(last, 11)
+  })
+
+  test('it stays a total across page boundaries instead of becoming a remainder', async () => {
+    // 25 rows at 10 per page. A per-page filter_count passed straight through
+    // would report 25, 15, 5 -- and sync() comparing its running pull against
+    // the last of those would refuse a listing that delivered everything.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 25 })))
+    const adapter = adapterFor(fake.url, ['post'])
+    const { totals: seen, last, pulled } = await totals(adapter, 10)
+    assert.equal(pulled, 25)
+    assert.equal(last, 25)
+    assert.ok(seen.every((t) => t === 25), `every page should report 25, got ${seen.join(',')}`)
+  })
+
+  test('a delta listing counts what the delta matches, not the collection', async () => {
+    const fake = track(await startFakeDirectus(fakeRows({ post: 10 })))
+    const adapter = adapterFor(fake.url, ['post'])
+    // fakeRows stamps date_created at 1s intervals from the epoch below, so this
+    // cuts the collection in half.
+    const since = 1_700_000_000_000 + 4500
+    const { last, pulled } = await totals(adapter, 100, since)
+    assert.equal(last, pulled)
+    assert.ok(pulled > 0 && pulled < 10, `expected a partial delta, pulled ${pulled}`)
+  })
+
+  test('a response with no meta reports no total rather than a wrong one', async () => {
+    // An older Directus, a proxy that strips meta, or a permission that hides
+    // it. Absence has to reach sync() as undefined, which disables the check --
+    // a zero here would read as "the CMS is empty" and refuse every document.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 5 }), { omitMeta: true }))
+    const adapter = adapterFor(fake.url, ['post'])
+    const { totals: seen, pulled } = await totals(adapter, 100)
+    assert.equal(pulled, 5)
+    assert.ok(seen.every((t) => t === undefined), `expected no totals, got ${seen.join(',')}`)
+  })
+
+  test('a second listing on the same adapter does not inherit the first count', async () => {
+    // The accumulator is adapter state, and the service reuses one adapter for
+    // every sync. Without a reset the second listing reports double and sync()
+    // refuses a complete pull.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 4, tag: 2 })))
+    const adapter = adapterFor(fake.url, ['post', 'tag'])
+    const first = await totals(adapter, 100)
+    const second = await totals(adapter, 100)
+    assert.equal(first.last, 6)
+    assert.equal(second.last, 6)
+  })
+
+  test('the count rides on the same request rather than adding one', async () => {
+    // The reason this is affordable at all, and the thing the adapter's previous
+    // comment assumed was impossible. Phase 2b found request count dominates
+    // sync wall time, so a count costing a request per page would not be worth
+    // having.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 25 })))
+    const adapter = adapterFor(fake.url, ['post'])
+    await totals(adapter, 10)
+    const items = fake.requests().filter((r) => r.path.startsWith('/items/'))
+    assert.equal(items.length, 3, 'three pages, three requests')
+    assert.ok(items.every((r) => r.query.meta === 'filter_count'))
+  })
+})

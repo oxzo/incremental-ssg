@@ -442,6 +442,59 @@ MUTATIONS: list[Mutation] = [
         "the shape this replaced: two workers resolving different route sets of equal length agree and the build ships the mixture",
         "test/route-plan.test.ts",
     ),
+    # --- the listing count, and what it is allowed to claim -------------------
+    #
+    # CmsPage.total was declared, threaded through, and read by nothing, so none
+    # of these lines existed to be broken. The first mutation is the finding; the
+    # rest guard the ways a count can be worse than no count at all.
+    Mutation(
+        "sync-short-listing-accepted",
+        "src/sync.ts",
+        "  if (expected !== undefined && pulled < expected) {",
+        "  if (false) {",
+        "a listing that came back short is reconciled as deletions, and the ratio ceiling passes anything under half the mirror",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-short-listing-two-sided",
+        "src/sync.ts",
+        "  if (expected !== undefined && pulled < expected) {",
+        "  if (expected !== undefined && pulled !== expected) {",
+        "a document created while the pull ran makes the count an undercount, so the rail refuses a CMS that behaved correctly",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "directus-count-is-a-remainder",
+        "src/cms-directus.ts",
+        "      if (seq === 0) {",
+        "      if (true) {",
+        "counting every page double-counts a keyset remainder, so total exceeds the pull and sync refuses complete listings",
+        "test/cms-directus.test.ts",
+    ),
+    Mutation(
+        "directus-missing-count-guessed",
+        "src/cms-directus.ts",
+        "        else countable = false",
+        "        else expected += 0",
+        "a response with no meta reports total 0 instead of no total, which reads as an empty CMS rather than an unknown one",
+        "test/cms-directus.test.ts",
+    ),
+    Mutation(
+        "directus-count-not-reset",
+        "src/cms-directus.ts",
+        "      if (o.cursor === null) {",
+        "      if (false) {",
+        "the service reuses one adapter, so the second sync inherits the first's total and refuses a complete pull",
+        "test/cms-directus.test.ts",
+    ),
+    Mutation(
+        "directus-count-not-requested",
+        "src/cms-directus.ts",
+        "        meta: 'filter_count',",
+        "        meta: '',",
+        "the count is never asked for, so every listing reports no total and the completeness check silently does nothing",
+        "test/cms-directus.test.ts",
+    ),
     # --- draining a pool before reporting that it failed ----------------------
     #
     # Both pools used to reject while their work continued. The tell was not in
