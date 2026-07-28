@@ -25,6 +25,7 @@ import { readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { join, extname } from 'node:path'
 import { hashTree, statTree } from './hash-tree.ts'
 import { pool } from './pool.ts'
+import { RailError } from './rails.ts'
 import type { TreeDigests } from './hash-tree.ts'
 
 /** Bumped when a change here makes an existing seal file unreadable. */
@@ -273,20 +274,35 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
 
   const seal = opts.seal ?? (opts.workDir ? readSeal(opts.workDir) : null)
   if (!seal) {
-    throw new Error(
+    // Transient: the next build writes a seal. This is the canonical
+    // self-clearing rail -- it fires precisely because a build died, and the
+    // remedy is the thing a retry does anyway.
+    throw new RailError(
+      'deploy-no-seal',
+      false,
       `deploy() found no build seal${opts.workDir ? ` in ${opts.workDir}` : ''}. A build ` +
       `writes one only after every route has been rendered and counted, so a missing ` +
       `seal means the last build did not finish -- and a diff against a partial tree ` +
       `issues deletes for pages that are still live. Re-run the build.`)
   }
   if (seal.outDir !== outDir) {
-    throw new Error(
+    // Terminal: two directories were configured to disagree, and no number of
+    // retries reconciles a configuration mistake.
+    throw new RailError(
+      'deploy-seal-mismatch',
+      true,
       `deploy() seal describes ${seal.outDir} but was asked to deploy ${outDir}. ` +
       `Deploying one build's tree against another build's seal would validate the ` +
       `wrong thing.`)
   }
   if (!seal.clean && !force) {
-    throw new Error(
+    // Terminal: whoever called build() passed clean:false, and calling it again
+    // the same way produces the same unclean tree. The service always builds
+    // with clean:true, so this firing under the service means its wiring is
+    // wrong -- which is worth halting on rather than retrying past.
+    throw new RailError(
+      'deploy-not-clean',
+      true,
       `deploy() refuses a build that did not clean ${outDir} first. Nothing removes ` +
       `output left by an earlier build, so a deleted page and an edited image's old ` +
       `derivatives are still sitting in the tree -- and because they match what is ` +
@@ -296,7 +312,11 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
   }
   const actual = statTree(outDir)
   if (actual.files !== seal.files || actual.bytes !== seal.bytes) {
-    throw new Error(
+    // Transient: something mutated the tree after the build, and a clean rebuild
+    // re-establishes agreement between tree and seal.
+    throw new RailError(
+      'deploy-tree-mismatch',
+      false,
       `deploy() output tree does not match its seal: ${actual.files} files / ` +
       `${actual.bytes} bytes on disk against ${seal.files} / ${seal.bytes} sealed. ` +
       `Something changed or removed build output after the build completed; ` +
@@ -318,7 +338,15 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
     plan.deleted.length / remote.length > maxDeleteRatio &&
     !force
   ) {
-    throw new Error(
+    // Terminal, and the clearest case of the distinction. The build emitted
+    // fewer pages than the site has; rebuilding from the same store emits the
+    // same short tree and refuses again. A service that retried this would
+    // re-refuse every few seconds forever while the site went stale -- busy logs,
+    // no publishing, no alert. Halting and reporting unhealthy is the only shape
+    // that surfaces it.
+    throw new RailError(
+      'deploy-delete-ratio',
+      true,
       `deploy() would delete ${plan.deleted.length} of ${remote.length} live objects ` +
       `(${((plan.deleted.length / remote.length) * 100).toFixed(0)}%), over the ` +
       `${maxDeleteRatio * 100}% limit. This usually means the build emitted fewer ` +

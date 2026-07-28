@@ -7,6 +7,7 @@
 // the CMS", which a re-sync fixes, rather than "the cache disagrees with the
 // content", which nothing fixes.
 import { DatabaseSync } from 'node:sqlite'
+import { RailError } from './rails.ts'
 import type { Doc, DocsByType } from './config.ts'
 
 /** Bumped when a change here makes an existing database file unreadable. */
@@ -101,6 +102,24 @@ export class DocumentStore {
       .run(key, value)
   }
 
+  /**
+   * The stored revision for one document, or null if it is not in the mirror.
+   *
+   * The read-after-write check in the webhook service is the only caller: a
+   * webhook says "document X is now at revision R", and this answers whether the
+   * mirror has caught up. Only meaningful when the CMS's list payload and its
+   * webhook payload carry the *same* revision identifier -- sync falls back to
+   * the content hash for a CMS with no revision concept, and a hash will never
+   * equal a webhook's revision string. That is what `webhookRevisions` declares,
+   * and why an unsatisfied check is reported rather than fatal.
+   */
+  revisionOf(id: string): string | null {
+    const row = this.db.prepare('SELECT revision FROM documents WHERE id = ?').get(id) as
+      | { revision: string }
+      | undefined
+    return row ? row.revision : null
+  }
+
   /** Existing content hashes, for deciding what a full pull actually changed. */
   hashes(): Map<string, string> {
     const rows = this.db.prepare('SELECT id, hash FROM documents').all() as
@@ -153,7 +172,15 @@ export class DocumentStore {
     const doomed = [...local].filter((id) => !live.has(id))
     if (doomed.length === 0) return 0
     if (local.size > 0 && doomed.length / local.size > maxDeleteRatio && !force) {
-      throw new Error(
+      // Transient, which looks wrong for a mass-delete refusal and is not. The
+      // refusal itself deletes nothing, so retrying is safe by construction --
+      // and the likeliest cause, a listing that came back short, is exactly the
+      // kind of thing that succeeds on the next attempt. If the CMS really did
+      // lose half its documents the rail refuses again every time, and the
+      // service's consecutive-failure count is what surfaces that.
+      throw new RailError(
+        'store-delete-ratio',
+        false,
         `deleteMissing() would drop ${doomed.length} of ${local.size} documents ` +
         `(${((doomed.length / local.size) * 100).toFixed(0)}%), over the ` +
         `${maxDeleteRatio * 100}% limit. This usually means the reconcile scan ` +

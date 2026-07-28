@@ -4,11 +4,17 @@
 //   sync    pull the CMS into the local document mirror
 //   build   render the mirror to static HTML
 //   deploy  upload and purge only the files the build changed
+//   serve   webhook endpoint that does all three, unattended
 //
-// Three commands rather than one because they fail differently and are
-// triggered differently: sync is the only stage that touches the CMS, a build
-// must be runnable offline against whatever the last sync left behind, and
-// deploy is the only stage that can damage a live site.
+// Four commands rather than one because they fail differently and are triggered
+// differently: sync is the only stage that touches the CMS, a build must be
+// runnable offline against whatever the last sync left behind, deploy is the only
+// stage that can damage a live site, and serve is the only one that runs with
+// nobody reading its output.
+//
+// build, deploy and serve all take the build lock. A lock only the service
+// respects would not be a lock -- the collision worth preventing is an operator
+// running `build` by hand while a scheduled publish is mid-render.
 import { parseArgs } from 'node:util'
 import { dirname, resolve } from 'node:path'
 import { httpCmsAdapter } from './cms.ts'
@@ -18,6 +24,9 @@ import { build } from './build.ts'
 import { deploy } from './deploy.ts'
 import { directoryTarget } from './deploy-mock.ts'
 import { loadSite } from './config.ts'
+import { withLock } from './build-lock.ts'
+import { createPipeline, createService, jsonLog } from './service.ts'
+import { startWebhookServer } from './webhook.ts'
 
 const USAGE = `incremental-ssg
 
@@ -26,11 +35,18 @@ const USAGE = `incremental-ssg
          [--no-delta] [--no-id-listing]
 
   build  --site <module> --db <file> --out <dir>
-         [--workers N] [--clean] [--skip-assets]
+         [--workers N] [--clean] [--skip-assets] [--force-unlock]
 
   deploy --out <dir> --to <dir> [--db <file> | --work-dir <dir>]
          [--dry-run] [--force] [--max-delete-ratio R]
-         [--purge-added] [--no-digests] [--concurrency N]
+         [--purge-added] [--no-digests] [--concurrency N] [--force-unlock]
+
+  serve  --site <module> --db <file> --out <dir> --cms <url> --to <dir>
+         [--port N] [--host H] [--path /webhook]
+         [--secret S] [--hmac-secret S] [--allow-unauthenticated]
+         [--debounce MS] [--max-delay MS] [--poll MS]
+         [--workers N] [--page-size N] [--build-on-start]
+         [--dry-run] [--max-delete-ratio R] [--purge-added]
 
 Notes
   --page-size is the dominant lever on sync wall time: at 300ms round-trip,
@@ -46,6 +62,22 @@ Notes
   interface. --dry-run prints the plan without touching the target.
   --no-digests simulates a target that cannot report content hashes, which
   degrades the diff to a full upload rather than to silence.
+
+  serve is the only unattended command. It refuses to start without --secret
+  or --hmac-secret unless --allow-unauthenticated is passed: an open endpoint
+  that triggers a full build is a denial of service needing no payload. Prefer
+  WEBHOOK_SECRET / WEBHOOK_HMAC_SECRET in the environment over a flag, since
+  a secret on the command line is visible in ps.
+  It always builds with clean output, because the deploy refuses anything else.
+  Editor saves arrive in bursts, so triggers are debounced (--debounce) but
+  never delayed past --max-delay. --poll is the net under unreliable webhook
+  delivery; a missed publish that silently never builds is the worst failure
+  available here. Endpoints: POST <path>, POST <path>/build (forces a publish,
+  and clears a halt), GET /health (unauthenticated, up or down), GET /status.
+
+  --force-unlock breaks a held build lock. Only for a holder that is gone but
+  whose pid has been reused -- concurrent builds corrupt the store, the output
+  tree and the seal at once.
 `
 
 const fail = (msg: string): never => {
@@ -55,6 +87,17 @@ const fail = (msg: string): never => {
 
 const ms = (n: number) => `${n.toFixed(0)}ms`
 const need = (v: string | undefined, flag: string) => v ?? fail(`--${flag} is required`)
+
+/**
+ * Report a refusal as a message, not a stack.
+ *
+ * The rails throw text written to be read by a person deciding whether to
+ * override them, and a stack trace buries the explanation under the frames.
+ */
+const die = (e: unknown): never => {
+  console.error(`error: ${e instanceof Error ? e.message : String(e)}`)
+  process.exit(1)
+}
 
 const command = process.argv[2]
 const argv = process.argv.slice(3)
@@ -108,16 +151,19 @@ if (command === 'sync') {
       workers: { type: 'string' },
       clean: { type: 'boolean' },
       'skip-assets': { type: 'boolean' },
+      'force-unlock': { type: 'boolean' },
     },
   })
-  const r = await build({
-    site: resolve(need(values.site, 'site')),
-    dbPath: resolve(need(values.db, 'db')),
-    outDir: resolve(need(values.out, 'out')),
-    workers: values.workers ? Number(values.workers) : undefined,
-    clean: values.clean,
-    skipAssets: values['skip-assets'],
-  })
+  const dbPath = resolve(need(values.db, 'db'))
+  const r = await withLock(dirname(dbPath), { label: 'cli build', force: values['force-unlock'] }, () =>
+    build({
+      site: resolve(need(values.site, 'site')),
+      dbPath,
+      outDir: resolve(need(values.out, 'out')),
+      workers: values.workers ? Number(values.workers) : undefined,
+      clean: values.clean,
+      skipAssets: values['skip-assets'],
+    })).catch(die)
   console.log(
     `${r.site}: ${r.routes} routes from ${r.documents} documents, ` +
     `${(r.bytes / 1024 / 1024).toFixed(1)} MiB, ${r.workers} workers, ${ms(r.ms.total)}`)
@@ -144,6 +190,7 @@ if (command === 'sync') {
       'purge-added': { type: 'boolean' },
       'no-digests': { type: 'boolean' },
       concurrency: { type: 'string' },
+      'force-unlock': { type: 'boolean' },
     },
   })
   const outDir = resolve(need(values.out, 'out'))
@@ -159,22 +206,19 @@ if (command === 'sync') {
     dir: resolve(need(values.to, 'to')),
     capabilities: { digestListing: !values['no-digests'] },
   })
-  // The rails throw messages written to be read by a person deciding whether to
-  // override them. A stack trace buries the explanation under the frames, which
-  // is the wrong trade for the one command that can damage a live site.
-  const r = await deploy({
-    outDir,
-    target,
-    workDir,
-    dryRun: values['dry-run'],
-    force: values.force,
-    purgeAdded: values['purge-added'],
-    maxDeleteRatio: values['max-delete-ratio'] ? Number(values['max-delete-ratio']) : undefined,
-    concurrency: values.concurrency ? Number(values.concurrency) : undefined,
-  }).catch((e: unknown) => {
-    console.error(`error: ${e instanceof Error ? e.message : String(e)}`)
-    process.exit(1)
-  })
+  // Under the lock: this reads the seal and every emitted byte, and a build
+  // running underneath it would be rewriting both while the diff is computed.
+  const r = await withLock(workDir, { label: 'cli deploy', force: values['force-unlock'] }, () =>
+    deploy({
+      outDir,
+      target,
+      workDir,
+      dryRun: values['dry-run'],
+      force: values.force,
+      purgeAdded: values['purge-added'],
+      maxDeleteRatio: values['max-delete-ratio'] ? Number(values['max-delete-ratio']) : undefined,
+      concurrency: values.concurrency ? Number(values.concurrency) : undefined,
+    })).catch(die)
   const p = r.plan
   console.log(
     `${r.dryRun ? 'plan' : r.target}: ${p.added.length} added, ${p.modified.length} modified, ` +
@@ -193,6 +237,99 @@ if (command === 'sync') {
   if (p.deleted.length > 0) {
     for (const path of p.deleted.slice(0, 10)) console.log(`  - ${path}`)
     if (p.deleted.length > 10) console.log(`  - … and ${p.deleted.length - 10} more`)
+  }
+} else if (command === 'serve') {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      site: { type: 'string' },
+      db: { type: 'string' },
+      out: { type: 'string' },
+      cms: { type: 'string' },
+      to: { type: 'string' },
+      'work-dir': { type: 'string' },
+      port: { type: 'string' },
+      host: { type: 'string' },
+      path: { type: 'string' },
+      secret: { type: 'string' },
+      'hmac-secret': { type: 'string' },
+      'allow-unauthenticated': { type: 'boolean' },
+      debounce: { type: 'string' },
+      'max-delay': { type: 'string' },
+      poll: { type: 'string' },
+      workers: { type: 'string' },
+      'page-size': { type: 'string' },
+      'build-on-start': { type: 'boolean' },
+      'dry-run': { type: 'boolean' },
+      'max-delete-ratio': { type: 'string' },
+      'purge-added': { type: 'boolean' },
+      'force-unlock': { type: 'boolean' },
+    },
+  })
+  const site = resolve(need(values.site, 'site'))
+  const dbPath = resolve(need(values.db, 'db'))
+  const outDir = resolve(need(values.out, 'out'))
+  const workDir = resolve(values['work-dir'] ?? dirname(dbPath))
+
+  const adapter = httpCmsAdapter({ baseUrl: need(values.cms, 'cms') })
+  const target = directoryTarget({ dir: resolve(need(values.to, 'to')) })
+
+  const pipeline = createPipeline({
+    site,
+    dbPath,
+    outDir,
+    workDir,
+    adapter,
+    target,
+    workers: values.workers ? Number(values.workers) : undefined,
+    pageSize: values['page-size'] ? Number(values['page-size']) : undefined,
+    forceUnlock: values['force-unlock'],
+    deploy: {
+      dryRun: values['dry-run'],
+      purgeAdded: values['purge-added'],
+      maxDeleteRatio: values['max-delete-ratio'] ? Number(values['max-delete-ratio']) : undefined,
+    },
+  })
+
+  const service = createService({
+    run: pipeline,
+    lockDir: workDir,
+    debounceMs: values.debounce ? Number(values.debounce) : undefined,
+    maxDelayMs: values['max-delay'] ? Number(values['max-delay']) : undefined,
+    pollMs: values.poll ? Number(values.poll) : undefined,
+    buildOnStart: values['build-on-start'],
+  })
+
+  // Environment first: a secret passed as a flag is visible to every user on the
+  // box via ps, for the whole life of a long-running service.
+  const http = await startWebhookServer({
+    service,
+    adapter,
+    port: values.port ? Number(values.port) : 8787,
+    host: values.host,
+    path: values.path,
+    secret: process.env.WEBHOOK_SECRET ?? values.secret,
+    hmacSecret: process.env.WEBHOOK_HMAC_SECRET ?? values['hmac-secret'],
+    allowUnauthenticated: values['allow-unauthenticated'],
+  }).catch(die)
+
+  service.start()
+
+  // Stop accepting deliveries first, then let the run in flight finish. The
+  // reverse order would accept a webhook it is about to stop being able to serve,
+  // and the sender would count it as delivered.
+  let closing = false
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(sig, () => {
+      if (closing) return
+      closing = true
+      jsonLog({ event: 'service.stopping', signal: sig })
+      void (async () => {
+        await http.close()
+        await service.stop()
+        process.exit(0)
+      })()
+    })
   }
 } else if (command === 'help' || command === '--help' || command === '-h') {
   console.log(USAGE)

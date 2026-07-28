@@ -9,7 +9,7 @@ diff that uploads only the files an edit actually changed.
 No build step: Node's native type stripping runs the TypeScript directly.
 
 ```sh
-npm test          # 116 tests
+npm test          # 161 tests
 npm run demo      # mock CMS -> sync -> assets -> render -> write -> deploy
 npm run cli help
 ```
@@ -171,6 +171,94 @@ At 1600px: effort 0 = 87ms, effort 2 = 194ms, effort 4 (**sharp's default**) =
 `src/asset-cache.ts` sets it explicitly so it is a decision rather than an
 accident. Do not tidy it back to the default.
 
+## The publish service
+
+`npm run cli serve` is the only unattended command, and that changes what a
+safety rail means. Every rail in this codebase was designed against a human who
+typed a command and could read a refusal; unattended, the same throw becomes a
+site that silently stops updating — which is the worst failure available here.
+
+So a refusal now carries one extra bit (`src/rails.ts`): can re-running change
+the answer?
+
+- **Self-clearing** — no build seal (the build died; the next one writes one),
+  output drifted from its seal. Retried with doubling backoff. The persisted
+  dirty flag keeps the pending publish alive across every retry and restart.
+- **Terminal** — the delete-ratio ceiling (the build genuinely emitted fewer
+  pages than the site has, so a rebuild refuses again), a seal describing a
+  different directory, a held build lock. Publishing halts, the last good site
+  keeps serving, `/health` goes 503. `POST <path>/build` is the way back.
+
+After 3 consecutive transient failures the service reports unhealthy while still
+retrying, because "busy forever and never publishing" has to be visible to
+something.
+
+### What is persisted, and what is not
+
+There is no durable event queue, and that is a design decision rather than a
+shortcut. Every build is a full build — the Phase 0 gate killed per-document
+invalidation — so the pipeline can never act on *which* documents changed, only
+on whether anything did. A queue of webhook payloads would persist per-document
+detail nothing downstream can read, while carrying all the completeness hazards
+this codebase keeps meeting.
+
+What must survive a crash is one bit: is a publish outstanding? It lives in the
+store's meta table as `service:dirty`, **set before the build starts and cleared
+only after the deploy succeeds**. That ordering is the whole guarantee.
+Set-after-build loses a publish to a crash mid-build; clear-before-deploy loses
+one to a crash mid-deploy. Either way sync has already advanced its watermark, so
+the next run finds nothing changed, never rebuilds, and raises no error.
+
+### Coalescing
+
+Editors save in bursts, so triggers are debounced (2s) but never delayed past a
+cap (15s) — a plain reset-on-every-event debounce starves under a steady stream
+and never builds at all. A trigger arriving *during* a run sets pending and the
+finishing run re-arms; dropping it would be silent, since the dirty flag would be
+clear and the next sync would report nothing changed. Only webhook and manual
+triggers reset the quiet period: a poll is the net, not an editor.
+
+Polling (60s) exists because webhook delivery is not reliable. The skip rule —
+sync found nothing changed and nothing was outstanding, so don't build — is safe
+for content and a real gap for **code**: a template edit changes the output while
+sync sees nothing. `POST <path>/build` forces past it, and so does a restart.
+
+### The endpoint
+
+`POST <path>` queues, `POST <path>/build` forces, `GET /health` is
+unauthenticated and coarse (up or down), `GET /status` is authenticated and
+detailed.
+
+It answers **before** it builds. A CMS webhook sender times out in seconds and
+retries on timeout, so holding the connection open for a ~10s build turns one
+publish into a retry storm. It also refuses to start without a secret: an open
+endpoint that triggers a full build is a denial of service needing no payload,
+and that belongs in the code rather than a deployment checklist. Bodies are
+capped while streaming, not after.
+
+### The build lock
+
+`build`, `deploy` and `serve` all take a lock file in the work directory. A lock
+only the service respected would not be a lock — the collision worth preventing
+is an operator running `build` by hand during a scheduled publish, which an
+in-process mutex cannot see. Two builds sharing one store, output tree and seal
+corrupt all three at once.
+
+A lock whose holder is *provably* gone is reclaimed automatically, because one
+crash must not wedge publishing forever. A holder that might be alive is never
+stolen: two concurrent builds are a correctness failure where a stalled service
+is only a liveness one. The honest limit is pid reuse, which looks alive and
+needs `--force-unlock`.
+
+The lock file is written to a temp name and **linked** into place rather than
+created with `wx` and filled afterwards. `wx` is atomic about creating a file but
+not about filling it, which leaves a window where the lock exists and is empty —
+and a racer reading it there finds unparseable JSON, judges the lock corrupt,
+deletes it, and takes a lock someone else holds. Worth knowing: the
+six-process race test passes against the broken version too (checked, not
+assumed — the window is microseconds wide against tens of milliseconds of process
+startup), so this one is justified by construction rather than by the test.
+
 ## CMS adapters
 
 Only one CMS will ever be targeted, so the adapter interface is not about
@@ -179,7 +267,8 @@ while document *shapes* barely differ at all:
 
 1. cursor-based delta sync — absent, every sync is a full pull
 2. cheap full-ID listing — absent, deletes are undetectable
-3. revision identifiers in webhooks — absent, no read-after-write check
+3. revision identifiers in webhooks — absent, no read-after-write check (the
+   service says so rather than running a check that cannot mean anything)
 
 `capabilities` is data the sync driver branches on. No real CMS has been chosen
 yet; `src/cms-mock.ts` is currently the only target.
@@ -201,7 +290,11 @@ yet; `src/cms-mock.ts` is currently the only target.
 | `src/build.ts`, `src/render-worker.ts` | build driver, worker pool, build seal |
 | `src/hash-tree.ts`, `src/pool.ts` | tree digests, and the one bounded-parallel map |
 | `src/deploy.ts`, `src/deploy-mock.ts` | the deploy diff, its rails, and a directory target |
-| `src/cli.ts` | `sync`, `build`, and `deploy` commands |
+| `src/rails.ts` | `RailError`, and whether re-running can clear a refusal |
+| `src/build-lock.ts` | the single-writer lock every writer takes |
+| `src/service.ts` | the publish pipeline and the trigger coalescer |
+| `src/webhook.ts` | the HTTP endpoint, its auth, and its body cap |
+| `src/cli.ts` | `sync`, `build`, `deploy`, and `serve` commands |
 | `example/blog/` | the example site, its sample corpus, and `demo.ts` |
 | `bench/` | Phase 0 / 2b / 2c harnesses and `RESULTS.md` |
 
@@ -219,6 +312,6 @@ tested there. What it left undone is *tuning against a real network*; every sync
 number in `bench/RESULTS.md` comes from a mock on localhost, where round-trip
 time is meaningless.
 
-Next: the webhook service (Phase 5), and a real adapter on both ends — a real
-CMS and a real deploy target — which is where auth, rate limiting, pagination
-caps, and per-request latency finally show up.
+Next: a real adapter on both ends — a real CMS and a real deploy target — which
+is where auth, rate limiting, pagination caps, and per-request latency finally
+show up. Everything upstream of that is built.
