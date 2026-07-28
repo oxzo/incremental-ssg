@@ -11,6 +11,7 @@
 import { createHash } from 'node:crypto'
 import { checkNumber } from './rails.ts'
 import type { CmsAdapter, CmsDocument } from './cms.ts'
+import { documentIdentity } from './store.ts'
 import type { DocumentStore, UpsertInput } from './store.ts'
 
 const WATERMARK = 'sync:watermark'
@@ -123,10 +124,11 @@ export async function sync(
   // makes the redundant documents cost nothing downstream.
   const since = canDelta ? Math.max(0, (watermark as number) - 1) : undefined
 
-  const known = store.hashes()
+  const known = store.identities()
   let cursor: string | null = null
   let pulled = 0
   let changed = 0
+  let deleted = 0
   let requests = 0
   let maxUpdatedAt = watermark ?? 0
   let httpMs = 0
@@ -155,14 +157,33 @@ export async function sync(
     requests++
 
     const batch: UpsertInput[] = []
+    // Documents the CMS still has, at a type this site does not render.
+    const unwanted: string[] = []
     for (const item of page.items as CmsDocument[]) {
       pulled++
+      // Added before the type filter, and it belongs there. `seen` answers "did
+      // the CMS still have this document", which is true whatever its type is
+      // now -- and it feeds deleteMissing, whose ratio rail is about listings
+      // that came back short. Dropping an out-of-scope document from `seen`
+      // would delete its row for the wrong reason and charge it to that rail.
       seen.add(item.id)
       if (item.updatedAt > maxUpdatedAt) maxUpdatedAt = item.updatedAt
-      if (wantTypes && !wantTypes.has(item.type)) continue
+      if (wantTypes && !wantTypes.has(item.type)) {
+        // A document that moved out of scope -- an included type to an excluded
+        // one. Without this its stored row survives every reconcile (it is in
+        // `seen` on a full pull, and listIds carries no type on a delta one), so
+        // the page it renders stays published against content nothing will ever
+        // update again. Removed here rather than reconciled away because this is
+        // positive per-document evidence, not an inference from absence.
+        if (known.has(item.id)) unwanted.push(item.id)
+        continue
+      }
       const json = canonicalJson(item.doc)
       const hash = sha(json)
-      if (known.get(item.id) !== hash) changed++
+      // Type included, because two rendered types are two sets of routes. A
+      // document moving between them with an unchanged body is a real change to
+      // what the site contains, and comparing hashes alone reports it as none.
+      if (known.get(item.id) !== documentIdentity(item.type, hash)) changed++
       batch.push({
         id: item.id,
         type: item.type,
@@ -177,8 +198,9 @@ export async function sync(
     const c = now()
     hashMs += c - b
 
-    if (batch.length > 0) markMutating()
+    if (batch.length > 0 || unwanted.length > 0) markMutating()
     store.upsertMany(batch)
+    deleted += store.deleteIds(unwanted)
     storeMs += now() - c
 
     cursor = page.cursor
@@ -188,7 +210,6 @@ export async function sync(
   // Deletes. A delta pull cannot return a document that no longer exists, so
   // without the reconcile scan a deleted post leaves its page live forever --
   // the failure mode where the build is "correct" and the site is wrong.
-  let deleted = 0
   const r0 = now()
   const wantReconcile = opts.reconcile ?? true
   if (wantReconcile && adapter.capabilities.idListing) {
@@ -199,12 +220,12 @@ export async function sync(
       // A full pull already enumerated everything; the second request would be
       // asking the CMS a question we just answered.
       markMutating()
-      deleted = store.deleteMissing(seen, { maxDeleteRatio: opts.maxDeleteRatio })
+      deleted += store.deleteMissing(seen, { maxDeleteRatio: opts.maxDeleteRatio })
     } else {
       const live = await adapter.listIds()
       requests++
       markMutating()
-      deleted = store.deleteMissing(new Set(live.map((l) => l.id)), {
+      deleted += store.deleteMissing(new Set(live.map((l) => l.id)), {
         maxDeleteRatio: opts.maxDeleteRatio,
       })
     }

@@ -80,7 +80,7 @@ describe('live stack — Directus', { skip: LIVE ? false : 'set ISSG_LIVE=1 with
     const store = freshStore()
     const res = await sync(adapter(), store, { pageSize: 500, full: true })
     assert.ok(res.pulled > 0, 'the corpus is not empty -- run stack/seed.ts')
-    assert.equal(res.pulled, store.hashes().size, 'no document arrived twice or went missing')
+    assert.equal(res.pulled, store.count(), 'no document arrived twice or went missing')
     store.close()
   })
 

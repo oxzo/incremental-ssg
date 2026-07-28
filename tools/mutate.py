@@ -201,7 +201,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "sync-mutating-never-set",
         "src/sync.ts",
-        "    if (batch.length > 0) markMutating()",
+        "    if (batch.length > 0 || unwanted.length > 0) markMutating()",
         "    if (false) markMutating()",
         "a sync that dies mid-write leaves no record, so the restart's own 'nothing changed' is believed and the publish is lost",
         "test/sync.test.ts",
@@ -251,6 +251,23 @@ MUTATIONS: list[Mutation] = [
         "  if (false) fail(`--${flag} must be a number`)",
         "the original defect: a typo in a numeric flag reaches the rails as NaN instead of being refused",
         "test/numeric-guards.test.ts",
+    ),
+    # --- content type transitions ---------------------------------------------
+    Mutation(
+        "sync-type-not-in-identity",
+        "src/sync.ts",
+        "      if (known.get(item.id) !== documentIdentity(item.type, hash)) changed++",
+        "      if (known.get(item.id) !== documentIdentity('', hash)) changed++",
+        "comparing content alone reports a document that changed type as unchanged, and routes are resolved per type",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-keeps-unrendered-type",
+        "src/sync.ts",
+        "        if (known.has(item.id)) unwanted.push(item.id)",
+        "        if (false) unwanted.push(item.id)",
+        "a document moved out of scope keeps its stored row, which no reconcile path can see, and its page stays published",
+        "test/sync.test.ts",
     ),
     # --- the route plan: containment, collisions, and cross-worker identity ----
     #
@@ -352,28 +369,47 @@ def main() -> int:
         return 0
 
     survivors = []
+    hung = []
+    stale = []
     for i, m in enumerate(selected, 1):
         killed, note = run(m)
-        # A hang is not a survival and must not read like one. Survived means the
-        # suite ran and noticed nothing; hung means it never finished, which is
-        # usually a leaked handle or an unbounded wait in the *test*, and is
-        # fixed somewhere completely different.
+        # Three ways to not be killed, and they are fixed in three different
+        # places, so the summary keeps them apart. Lumping them together is not
+        # cosmetic: a real unprotected line hiding among stale patterns is
+        # exactly the report nobody reads twice.
+        #
+        #   SURVIVED -- the suite ran and noticed nothing. The line is unprotected.
+        #   HUNG     -- it never finished, usually a leaked handle or an unbounded
+        #               wait in the *test*, or a mutated loop that outlives it.
+        #   STALE    -- the source moved and the mutation no longer matches
+        #               anything. It is testing nothing, and has been since the
+        #               edit that moved it.
         if killed:
             mark = "\033[32m kill \033[0m"
         elif note.startswith("HUNG"):
             mark = "\033[33m HUNG \033[0m"
+        elif note.startswith("PATTERN"):
+            mark = "\033[35m STALE \033[0m"
         else:
             mark = "\033[31m SURVIVED \033[0m"
         print(f"[{i:2d}/{len(selected)}] {mark} {m.id}")
         if not killed:
             print(f"          {note}: {m.why}")
-            survivors.append(m)
+            (hung if note.startswith("HUNG")
+             else stale if note.startswith("PATTERN")
+             else survivors).append(m)
 
     print()
-    if survivors:
-        print(f"{len(survivors)} of {len(selected)} mutations survived -- those lines are unprotected:")
-        for m in survivors:
-            print(f"  {m.id}  ({m.path})")
+    for label, group in (
+        ("survived -- those lines are unprotected", survivors),
+        ("never finished -- the test leaks a handle or waits unbounded", hung),
+        ("no longer match the source -- they have been testing nothing", stale),
+    ):
+        if group:
+            print(f"{len(group)} of {len(selected)} mutations {label}:")
+            for m in group:
+                print(f"  {m.id}  ({m.path})")
+    if survivors or hung or stale:
         return 1
     print(f"all {len(selected)} mutations killed")
     return 0

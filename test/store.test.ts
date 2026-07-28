@@ -1,7 +1,7 @@
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { DocumentStore, STORE_SCHEMA } from '../src/store.ts'
+import { DocumentStore, STORE_SCHEMA, documentIdentity } from '../src/store.ts'
 import { tmpdir, cleanup } from './fixture.ts'
 
 const dirs: string[] = []
@@ -79,10 +79,15 @@ describe('DocumentStore', () => {
     assert.throws(() => new DocumentStore(p), /schema/)
   })
 
-  test('hashes() exposes what is stored, for change detection', () => {
+  test('identities() exposes type and content, which is what change detection compares', () => {
     const s = new DocumentStore(fresh())
-    s.upsertMany([doc('a', 'post'), doc('b', 'post')])
-    assert.deepEqual([...s.hashes().entries()].sort(), [['a', 'h-a'], ['b', 'h-b']])
+    s.upsertMany([doc('a', 'post'), doc('b', 'page')])
+    // Type is in the value, so a document that moves between two rendered types
+    // with an unchanged body compares as different -- the case a hash-keyed
+    // map reported as no change at all.
+    assert.deepEqual(
+      [...s.identities().entries()].sort(),
+      [['a', documentIdentity('post', 'h-a')], ['b', documentIdentity('page', 'h-b')]])
     s.close()
   })
 

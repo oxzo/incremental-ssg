@@ -23,22 +23,45 @@ const fresh = () => {
 }
 after(() => dirs.forEach(cleanup))
 
-/** A CMS plus a store, torn down together. */
+/**
+ * A CMS plus a store, torn down together.
+ *
+ * Cleanup is registered here rather than left to each test's last line, and that
+ * is not tidiness. Most tests below close on the happy path, so an assertion
+ * that *fails* skips the close, leaves a listening server, and the file never
+ * exits -- turning a detected defect into a hang. tools/mutate.py reads a hang
+ * as "no result", so the suite would stop being able to tell anyone it caught
+ * the bug it caught. Found exactly that way, by a mutation that failed the right
+ * two tests and then hung.
+ *
+ * `close()` stays public and idempotent so the existing explicit calls are still
+ * correct, and closing early still frees the port.
+ */
+const open: { close: () => Promise<void> }[] = []
+after(async () => {
+  for (const h of open) await h.close()
+})
+
 async function harness(docs: MockDoc[], capabilities?: Partial<CmsCapabilities>) {
   const cms = await startMockCms(docs)
   const dbPath = fresh()
   const store = new DocumentStore(dbPath)
   const adapter = httpCmsAdapter({ baseUrl: cms.url, capabilities })
-  return {
+  let closed = false
+  const h = {
     store,
     adapter,
     cms,
     dbPath,
     async close() {
+      if (closed) return
+      closed = true
       store.close()
       await cms.close()
     },
   }
+  open.push(h)
+  return h
 }
 
 describe('canonicalJson', () => {
@@ -224,6 +247,150 @@ describe('sync', () => {
     assert.equal((stored.get('post') ?? []).length, 5)
     assert.equal((stored.get('author') ?? []).length, 0)
     await h.close()
+  })
+})
+
+/**
+ * A document that changes type, which is a change to the site and was not a
+ * change to the store.
+ *
+ * Change detection compared content hashes keyed on id, so the type a document
+ * carries was outside the comparison entirely. Routes are resolved per type, so
+ * a document moving between two rendered types moves which pages exist -- and
+ * the sync reported `changed: 0`, the service skipped the build, and the site
+ * kept serving the old shape.
+ *
+ * The second half is worse and quieter. A document moving to a type this site
+ * does *not* render kept its stored row: on a full pull it is in `seen`, and on
+ * a delta pull `listIds()` carries no type at all, so neither reconcile path can
+ * see it. Its page stayed published against content nothing would ever update.
+ */
+describe('content type transitions', () => {
+  const TYPES = ['post', 'author', 'tag', 'page', 'settings']
+
+  test('moving between two rendered types is a change, though the body is not', async () => {
+    const docs = blogDocs({ posts: 3 })
+    const h = await harness(docs)
+    try {
+      await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      const post = docs.find((d) => d.type === 'post')!
+      const id = String(post.doc.id)
+
+      // The only thing that differs is the type. Body, revision and timestamp
+      // are untouched, so a comparison on content alone sees nothing at all --
+      // which is exactly the case that used to slip through.
+      post.type = 'page'
+
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES, full: true })
+      assert.equal(r.changed, 1, 'a type change must be reported as a change')
+      assert.equal(r.deleted, 0, 'the document still exists and is still rendered')
+
+      const stored = h.store.byType(['page', 'post'])
+      assert.ok(
+        (stored.get('page') ?? []).some((d) => d.id === id),
+        'the document should now be stored as a page')
+      assert.ok(
+        !(stored.get('post') ?? []).some((d) => d.id === id),
+        'and no longer as a post')
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('an otherwise untouched re-sync still reports nothing changed', async () => {
+    // The control. Type is now part of the compared identity, and both sides
+    // build it through the same function -- so an unchanged corpus must still
+    // report zero rather than every document suddenly looking new.
+    const h = await harness(blogDocs({ posts: 4 }))
+    try {
+      const first = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      assert.ok(first.changed > 0)
+      const again = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES, full: true })
+      assert.equal(again.changed, 0)
+      assert.equal(again.deleted, 0)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('moving to an unrendered type removes the stored row, on a full pull', async () => {
+    const docs = blogDocs({ posts: 3 })
+    const h = await harness(docs)
+    try {
+      await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      const post = docs.find((d) => d.type === 'post')!
+      const id = String(post.doc.id)
+      assert.ok(h.store.ids().has(id))
+
+      // Still in the CMS, no longer a type this site renders -- an editor moving
+      // a post into an internal collection, or a config that stopped listing it.
+      post.type = 'internal-note'
+
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES, full: true })
+      assert.equal(r.deleted, 1, 'the out-of-scope document must leave the mirror')
+      assert.equal(h.store.ids().has(id), false)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('and on a delta pull, where the id listing cannot see types at all', async () => {
+    // The half a reconcile scan structurally cannot reach: listIds() returns
+    // ids and revisions, so a document that merely changed type is present and
+    // accounted for on every scan. Without the targeted removal this row
+    // survives indefinitely.
+    const docs = blogDocs({ posts: 3 })
+    const h = await harness(docs)
+    try {
+      await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      const post = docs.find((d) => d.type === 'post')!
+      const id = String(post.doc.id)
+
+      post.type = 'internal-note'
+      post.doc.updated_at = Number(post.doc.updated_at) + 1000
+
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      assert.equal(r.strategy, 'delta', 'this test is only meaningful on the delta path')
+      assert.equal(r.deleted, 1)
+      assert.equal(h.store.ids().has(id), false)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('a document that was never stored is not reported as deleted', async () => {
+    // The control for the two above: an excluded type that was never in scope
+    // is not a transition and must not inflate the delete count, which the
+    // service reads as "something changed, publish".
+    const docs = blogDocs({ posts: 2 })
+    docs.push({ type: 'internal-note', doc: { id: 'note-1', updated_at: 1, rev: 'r1' } })
+    const h = await harness(docs)
+    try {
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      assert.equal(r.deleted, 0)
+      assert.equal(h.store.ids().has('note-1'), false)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('deleteIds removes exactly the named rows and no others', async () => {
+    const h = await harness(blogDocs({ posts: 4 }))
+    try {
+      await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
+      const all = [...h.store.ids()]
+      const doomed = all.slice(0, 2)
+      // No ratio ceiling, deliberately: this is positive per-document evidence
+      // from the CMS, not an inference from a listing that might be short. Half
+      // the mirror would trip deleteMissing's rail; here it must not.
+      assert.equal(h.store.deleteIds(doomed), 2)
+      assert.equal(h.store.count(), all.length - 2)
+      // An id that is not stored is not an error and is not counted.
+      assert.equal(h.store.deleteIds(['no-such-id']), 0)
+      assert.equal(h.store.deleteIds([]), 0)
+    } finally {
+      await h.close()
+    }
   })
 })
 
