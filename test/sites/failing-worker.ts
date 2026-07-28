@@ -36,30 +36,48 @@ const outDir: string | undefined = workerData?.outDir
 /** Beside the output directory, not inside it -- the test counts what is inside. */
 const marker = outDir === undefined ? undefined : join(outDir, '..', 'worker-0-failed')
 
-/** ~300ms: long enough to be the parent's margin to terminate, short enough to
- *  leave the whole test under two seconds. */
-function burn(): number {
+function spin(iterations: number): number {
   let x = 0
-  for (let i = 0; i < 100_000_000; i++) x += Math.sqrt(i)
+  for (let i = 0; i < iterations; i++) x += Math.sqrt(i)
   return x
 }
 
 /**
+ * The margin before a sibling's first write, ~150ms.
+ *
+ * Sized from both directions, and the second one is easy to forget. Large
+ * enough that the parent has room to reject and terminate after worker 0's
+ * failure. Small enough that when the drain is *removed* -- which is what
+ * tools/mutate.py does to this rail -- the leaked work still finishes quickly,
+ * because a mutation whose test cannot finish is reported as a hang rather than
+ * as a kill. An earlier version of this file used 100M here across 40 routes;
+ * the leaked render then outlived the harness's 90s timeout on CI and turned a
+ * caught mutation into no result at all. That is M2's lesson pointed the other
+ * way: a test for a bound has to be able to fail by completing, and a test for a
+ * drain has to be able to fail *quickly*.
+ */
+const pageBurn = () => spin(50_000_000)
+
+/**
  * Block until worker 0 has failed.
  *
- * Bounded, and it gives up rather than hanging: if the marker never arrives the
- * test should fail on its assertions, not time out. A hang is the one result
- * this project's harness cannot tell apart from no result at all.
+ * Polled with a much smaller burn than a page costs, so the wait is responsive
+ * and its own bound stays tight: ~800 x 6ms is a five-second ceiling, not the
+ * seventy-five a page-sized poll would have given. Bounded and giving up rather
+ * than hanging, because a fixture that wedges turns a detected defect into no
+ * result, which the harness cannot tell from a pass.
  */
 function awaitFailure() {
   if (marker === undefined) return
-  for (let spins = 0; spins < 500; spins++) {
+  for (let spins = 0; spins < 800; spins++) {
     if (existsSync(marker)) return
-    burn()
+    spin(2_000_000)
   }
 }
 
-export const ROUTES = 40
+/** 12 routes over 4 workers: 3 per sibling, so an undrained pool leaks about a
+ *  second of work rather than a minute of it. */
+export const ROUTES = 12
 
 export default defineSite<FailIndex>({
   name: 'test-failing-worker',
@@ -74,7 +92,7 @@ export default defineSite<FailIndex>({
         throw new Error('worker 0 fails on purpose')
       }
       awaitFailure()
-      burn()
+      pageBurn()
       return `<p>${ctx.esc(ctx.site.title)}</p>`
     },
   },

@@ -180,8 +180,13 @@ describe('build — the worker pool drains before it reports failure', () => {
   // output directory, whoever wrote them.
   const written = (dir: string) => (existsSync(dir) ? fingerprint(dir).length : 0)
 
-  /** Long enough that undrained siblings would finish all ten of their pages. */
-  const settle = () => new Promise((r) => setTimeout(r, 1200))
+  /**
+   * Long enough that undrained siblings would finish all three of their pages,
+   * with room for a loaded two-core runner where a page costs several times what
+   * it does here. This is the window the leak has to show up in, so it is sized
+   * against the slowest machine that runs it rather than this one.
+   */
+  const settle = () => new Promise((r) => setTimeout(r, 3000))
 
   test('no worker writes anything after build() has rejected', async () => {
     const out = join(work('build-drain-out'), 'dist')
