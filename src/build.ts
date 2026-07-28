@@ -17,7 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { DocumentStore } from './store.ts'
 import { loadSite } from './config.ts'
 import { runAssetStage, emptyManifest } from './assets.ts'
-import { createContextFactory, createRenderer, renderRoute, writeOut } from './render.ts'
+import { createContextFactory, createRenderer, renderRoute, writeFile, planOutputs } from './render.ts'
 import { beginDeterministicWindow } from './determinism.ts'
 import { clearSeal, writeSeal, SEAL_SCHEMA } from './deploy.ts'
 import { statTree } from './hash-tree.ts'
@@ -144,7 +144,14 @@ export function renderRange(
   outDir: string,
   start: number,
   end: number,
-): { pages: number; bytes: number } {
+): { pages: number; bytes: number; digest: string } {
+  // The whole route set is planned, not just this slice. Two reasons, and both
+  // are about a caller that only owns part of the list. Every worker validates
+  // every route, so a traversal path in slice 5 is refused by worker 0 as well
+  // -- before any of them has written a byte. And the digest is the identity of
+  // the set the parent makes them agree on, which a per-slice plan could not
+  // produce.
+  const plan = planOutputs(outDir, p.routes)
   const contextFor = createContextFactory(p.site, p.renderer, p.manifest)
   const guard = beginDeterministicWindow(p.cfg.determinism ?? 'enforce')
   let bytes = 0
@@ -153,13 +160,15 @@ export function renderRange(
     for (let i = start; i < end; i++) {
       const route = p.routes[i]
       guard.setLabel(route.path)
-      bytes += writeOut(outDir, route.path, renderRoute(p.cfg, contextFor(route), route))
+      // The planned path, not a second derivation from route.path. Validating
+      // one string and writing another is how a check and its subject drift.
+      bytes += writeFile(plan.paths[i], renderRoute(p.cfg, contextFor(route), route))
       pages++
     }
   } finally {
     guard.end()
   }
-  return { pages, bytes }
+  return { pages, bytes, digest: plan.digest }
 }
 
 /**
@@ -180,8 +189,14 @@ export function sliceFor(total: number, index: number, count: number): { start: 
 export type WorkerReport = {
   pages: number
   bytes: number
-  /** Routes this worker resolved -- the parent checks every worker agrees. */
+  /** Routes this worker resolved. Reported so a disagreement can be described. */
   routes: number
+  /**
+   * Identity of the route set this worker resolved -- what the parent actually
+   * compares. The count alone cannot distinguish two different route sets of
+   * equal length, which is a build assembled from slices of two sites.
+   */
+  digest: string
   documents: number
   ms: Resolved['ms']
 }
@@ -291,15 +306,23 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     // handed out ranges, which made a worker resolving a different route set
     // impossible to notice -- it would simply render the wrong slice of a
     // different site and report success.
-    const counts = [...new Set(done.map((d) => d.routes))]
-    if (counts.length > 1) {
+    // Compared on the route set's identity rather than its size. The count check
+    // this replaces passed whenever two workers resolved different route lists
+    // that happened to be the same length -- each rendering its slice of a
+    // different site, both reporting success, and the seal vouching for the
+    // mixture. Equal digests imply equal counts, so nothing is lost; the count
+    // is still reported because "142 vs 138" describes the failure and two hex
+    // strings do not.
+    const digests = [...new Set(done.map((d) => d.digest))]
+    if (digests.length > 1) {
+      const shape = [...new Set(done.map((d) => `${d.routes} routes (${d.digest})`))]
       throw new Error(
-        `workers disagree on the route set: resolved ${counts.join(' vs ')} routes. ` +
+        `workers disagree on the route set: ${shape.join(' vs ')}. ` +
         `Site resolution must be a pure function of the store, and something here ` +
         `is not -- a build assembled from these slices would have gaps, overlaps, ` +
         `or both.`)
     }
-    routes = counts[0] ?? 0
+    routes = done[0]?.routes ?? 0
     documents = done[0]?.documents ?? 0
     // The slowest worker's, because that is what the wall clock actually waited
     // on. Reporting the fastest would understate the fixed cost this stage pays.

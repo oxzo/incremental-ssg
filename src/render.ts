@@ -4,8 +4,9 @@
 // route kinds. The engine now dispatches on `Route.kind` into the site's own
 // template map, so the only thing here that knows about content is nothing.
 import MarkdownIt from 'markdown-it'
+import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { mimeOf } from './assets.ts'
 import { allowNondeterministic } from './determinism.ts'
 import type { AssetManifest } from './assets.ts'
@@ -170,9 +171,128 @@ export function outputPath(outDir: string, route: string): string {
   return route.endsWith('/') ? join(outDir, route, 'index.html') : join(outDir, route)
 }
 
-export function writeOut(outDir: string, route: string, html: string): number {
-  const p = outputPath(outDir, route)
-  mkdirSync(dirname(p), { recursive: true })
-  writeFileSync(p, html)
+/**
+ * A route path that cannot be written, and why.
+ *
+ * Terminal by nature rather than by the rails' classification: the route came
+ * out of the site's own `routes()`, so re-running produces it again.
+ */
+export class UnsafeRouteError extends Error {
+  constructor(route: string, index: number, why: string) {
+    super(
+      `route ${index} (${JSON.stringify(route)}) ${why}. Route paths are ` +
+      `site-absolute URL paths ("/posts/a/"), and the engine writes one file per ` +
+      `route inside the output directory -- so a path that escapes it, or that ` +
+      `two routes share, is a write this build cannot account for.`)
+    this.name = 'UnsafeRouteError'
+  }
+}
+
+/**
+ * Where every route writes, proven to be inside `outDir`, plus the identity of
+ * the set.
+ *
+ * Two problems, one pass, because both need the whole route list resolved once
+ * and neither can be answered per route.
+ *
+ * **Containment.** `outputPath` joins a route straight into `outDir` and writes
+ * the result. Route paths come from the site's `routes()`, which interpolates
+ * CMS-derived slugs and ids -- so a slug containing `..` is a filesystem write
+ * primitive, reachable by anyone who can edit a document. Nothing downstream
+ * catches it: the file lands outside the tree, the seal never sees it, and the
+ * deploy diff never hears about it. This is the codebase's recurring hazard
+ * rotated ninety degrees -- not a set assumed complete, but a path assumed
+ * in-tree.
+ *
+ * **Identity.** Every render worker resolves the site independently so their
+ * slices line up by construction, which only works if they all resolve the
+ * *same* site. The parent compared route counts, and two workers can resolve
+ * different route sets of equal length -- rendering slices of incompatible sites
+ * and both reporting success. The digest here is what they actually compare.
+ *
+ * The digest covers each route's kind and path: which file, from which template.
+ * It deliberately does not cover the data a route carries, for cost (the sitemap
+ * route holds every other route's path, so hashing route data would hash the
+ * site twice) and because a worker resolving the same paths with different data
+ * is a determinism failure, which the determinism window and the byte-identity
+ * test already cover on their own axis.
+ */
+export type OutputPlan = {
+  /** Absolute output file per route, in route order. */
+  paths: string[]
+  /** Identity of the resolved route set; every worker must produce the same one. */
+  digest: string
+}
+
+export function planOutputs(outDir: string, routes: Route[]): OutputPlan {
+  const root = resolve(outDir)
+  // A prefix test needs the separator, or `/out-old` passes as being inside
+  // `/out`. Compared against `root + sep` for exactly that reason.
+  const prefix = root.endsWith(sep) ? root : root + sep
+  const paths: string[] = []
+  const firstUse = new Map<string, number>()
+  const h = createHash('sha256')
+
+  for (let i = 0; i < routes.length; i++) {
+    const route = routes[i]
+    const p = route?.path
+    const bad = (why: string): never => { throw new UnsafeRouteError(String(p), i, why) }
+
+    if (typeof p !== 'string' || p === '') bad('is not a non-empty string')
+    // A NUL truncates the path at the syscall boundary, so the string checked
+    // here and the path opened are different. Not a containment threat, and the
+    // reason is worth stating rather than leaving as an implied one: truncation
+    // can only shorten, and a shorter path under a validated prefix is still
+    // under it. Refused because a route naming a file the filesystem will not
+    // name is a mistake, and refusing it here reports the route index where
+    // letting it reach writeFileSync reports only a mangled path.
+    if (p.includes('\0')) bad('contains a NUL byte')
+    // Rejected rather than normalised. A backslash is a separator on Windows and
+    // an ordinary filename character on POSIX, so accepting it means one site
+    // emits a different tree per platform. On POSIX this check is the only thing
+    // that stops "/..\\..\\x" -- it resolves to a single in-tree filename here
+    // and to a traversal there, and a build that passes on the dev box would be
+    // the one that escapes in CI.
+    if (p.includes('\\')) bad('contains a backslash')
+
+    // The invariant, checked before the spelling rules below rather than after,
+    // so it is the thing that actually rejects an escape and the rules stay
+    // independently meaningful. Ordered the other way, ".." caught every real
+    // traversal first and this line became unreachable defence -- present,
+    // untestable, and impossible to tell apart from working.
+    const full = resolve(outputPath(root, p))
+    if (full === root || !full.startsWith(prefix)) bad('resolves outside the output directory')
+
+    // Reached only by a ".." that stays inside the tree, like "/posts/../a.html".
+    // Refused anyway: it names a file it does not look like, and two routes that
+    // spell one output differently collide below with no way to tell which was
+    // intended.
+    if (p.split('/').includes('..')) bad('contains a ".." segment')
+
+    const prior = firstUse.get(full)
+    if (prior !== undefined) {
+      bad(
+        `writes the same file as route ${prior} (${JSON.stringify(routes[prior].path)}). ` +
+        `One would silently overwrite the other while both counted as rendered`)
+    }
+    firstUse.set(full, i)
+    paths.push(full)
+    h.update(`${route.kind} ${p} `)
+  }
+
+  return { paths, digest: h.digest('hex').slice(0, 16) }
+}
+
+/** Write one already-planned output path. */
+export function writeFile(path: string, html: string): number {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, html)
   return Buffer.byteLength(html)
 }
+
+// `writeOut(outDir, route, html)` used to live here and is gone deliberately. It
+// derived the output path from the route a second time, at write time, so the
+// path that was validated and the path that was written came from two calls that
+// could drift. Everything now writes a planned path, so a route becomes a file in
+// exactly one place. bench/render-core.ts keeps its own copy -- that is the Phase
+// 0 harness, which is deliberately not the product.

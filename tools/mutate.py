@@ -252,6 +252,54 @@ MUTATIONS: list[Mutation] = [
         "the original defect: a typo in a numeric flag reaches the rails as NaN instead of being refused",
         "test/numeric-guards.test.ts",
     ),
+    # --- the route plan: containment, collisions, and cross-worker identity ----
+    #
+    # The four path rules are ordered so each one rejects something the others do
+    # not, which is what makes all four killable here. An earlier draft put the
+    # ".." rule ahead of the containment check; it caught every real traversal
+    # first, and the containment line -- the actual invariant -- became
+    # unreachable, present and untestable at once. The mutation that would have
+    # exposed that is `route-containment-off`.
+    Mutation(
+        "route-containment-off",
+        "src/render.ts",
+        "    if (full === root || !full.startsWith(prefix)) bad('resolves outside the output directory')",
+        "    if (false) bad('resolves outside the output directory')",
+        "a CMS slug containing '..' becomes a filesystem write outside the output tree, which no later stage sees",
+        "test/route-plan.test.ts",
+    ),
+    Mutation(
+        "route-dotdot-allowed",
+        "src/render.ts",
+        "    if (p.split('/').includes('..')) bad('contains a \"..\" segment')",
+        "    if (false) bad('contains a \"..\" segment')",
+        "an in-tree '..' names a file it does not look like, and collides with the route that spells it plainly",
+        "test/route-plan.test.ts",
+    ),
+    Mutation(
+        "route-backslash-allowed",
+        "src/render.ts",
+        "    if (p.includes('\\\\')) bad('contains a backslash')",
+        "    if (false) bad('contains a backslash')",
+        "a backslash is a separator on Windows and a filename character on POSIX, so the same site emits two trees",
+        "test/route-plan.test.ts",
+    ),
+    Mutation(
+        "route-duplicates-allowed",
+        "src/render.ts",
+        "    if (prior !== undefined) {",
+        "    if (false) {",
+        "two routes writing one file both count as rendered while one silently overwrites the other",
+        "test/route-plan.test.ts",
+    ),
+    Mutation(
+        "workers-compare-counts",
+        "src/build.ts",
+        "    const digests = [...new Set(done.map((d) => d.digest))]",
+        "    const digests = [...new Set(done.map((d) => String(d.routes)))]",
+        "the shape this replaced: two workers resolving different route sets of equal length agree and the build ships the mixture",
+        "test/route-plan.test.ts",
+    ),
     # --- the injection proxy, which is test infrastructure that can also lie ---
     Mutation(
         "proxy-truncation-is-a-noop",
