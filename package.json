@@ -8,7 +8,13 @@
   },
   "scripts": {
     "test": "node --no-warnings --test test/**/*.test.ts",
+    "test:mutate": "python3 tools/mutate.py",
     "demo": "node --no-warnings example/blog/demo.ts",
+    "stack:up": "bash stack/up.sh",
+    "stack:down": "bash stack/down.sh",
+    "stack:seed": "node --no-warnings stack/seed.ts",
+    "demo:live": "node --no-warnings stack/demo-live.ts",
+    "bench:adapters": "node --no-warnings bench/run-adapters.ts",
     "cli": "node --no-warnings src/cli.ts",
     "gate": "node --no-warnings bench/run.ts",
     "bench:sync-assets": "node --no-warnings bench/run-2b.ts",
@@ -17,6 +23,7 @@
     "bench:seam": "node --no-warnings bench/run-2-seam.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1096.0",
     "markdown-it": "^14.1.0",
     "sharp": "^0.35.3",
     "shiki": "^1.24.0"

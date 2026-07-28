@@ -474,3 +474,123 @@ and not chased further.
 (43.5s single-threaded). Not 8.8s (the harness, and a faster day), and not 13.9s
 (the contaminated measurement above it). The Phase 0 verdict is untouched and was
 never close to the line.
+
+---
+
+# Adapters — the two measurements that needed real services (2026-07-28)
+
+Both had been open since Phase 2b/2d and were blocked on one thing: every sync
+figure in this project came from a mock on localhost, where round-trip time is
+meaningless. Reproduce with `stack/up.sh && stack/seed.ts 2000` then
+`npm run bench:adapters`.
+
+**Setup.** Directus 12.1.1 and MinIO in podman, 2,011 documents (2,000 posts +
+11 others), 2,322 emitted objects in the bucket. RTT is *injected* by
+`stack/proxy.ts` in front of each service. Three rounds, configurations
+interleaved, spreads reported.
+
+**What injected latency is and is not.** It is a constant; real RTT is a
+distribution with a tail and load correlation. What it buys is a **swept**
+variable instead of a single sample, so the Phase 2b cost model can be checked
+across a range rather than anchored to whatever one host happened to do. Read
+the model column, not the absolute milliseconds.
+
+## 1. Page size against RTT — the Phase 2b model, checked
+
+| RTT | page size | requests | wall (spread) | median | http | predicted | delta |
+|---:|---:|---:|---|---:|---:|---:|---:|
+| 0ms | 50 | 45 | 826ms–955ms | 935ms | 766ms | — | — |
+| 0ms | 100 | 25 | 712ms–841ms | 777ms | 669ms | — | — |
+| 0ms | 500 | 9 | 597ms–635ms | 610ms | 564ms | — | — |
+| 0ms | 1000 | 7 | 589ms–631ms | 599ms | 562ms | — | — |
+| 25ms | 50 | 45 | 2.01s–2.12s | 2.02s | 1.85s | 2.06s | −2% |
+| 25ms | 100 | 25 | 1.39s–1.47s | 1.44s | 1.33s | 1.40s | +3% |
+| 25ms | 500 | 9 | 861ms–890ms | 879ms | 828ms | 835ms | +5% |
+| 25ms | 1000 | 7 | 800ms–820ms | 816ms | 778ms | 774ms | +5% |
+| 100ms | 50 | 45 | 5.53s–5.57s | 5.54s | 5.35s | 5.43s | +2% |
+| 100ms | 100 | 25 | 3.36s–3.42s | 3.37s | 3.26s | 3.28s | +3% |
+| 100ms | 500 | 9 | 1.62s–1.63s | 1.63s | 1.57s | 1.51s | +8% |
+| 100ms | 1000 | 7 | 1.40s–1.44s | 1.44s | 1.39s | 1.30s | +11% |
+
+**The 0ms rows are the model's `local` term, not evidence.** The prediction is
+`requests × RTT + local`, and `local` comes from the 0ms run at the same page
+size — so a 0ms row predicts itself and would read `+0%` whatever the truth was.
+They are shown as inputs, without a delta, on purpose.
+
+**The model holds, and is optimistic in a way that has a shape.** Latency rows
+land between −2% and +11% of prediction, and within each RTT the excess grows
+monotonically with page size (25ms: −2, +3, +5, +5; 100ms: +2, +3, +8, +11).
+That is the right shape for a fixed per-request cost the model omits — socket
+setup, JSON parse, the SQLite upsert — becoming a larger share of the total as
+the request count falls. Page size remains the dominant lever regardless: at
+100ms RTT, 50-per-page costs 5.54s against 1.44s at 1000-per-page.
+
+**Measured twice against two different proxy implementations.** An earlier run,
+before the proxy was rewritten from `fetch` to `node:http`, gave the same shape
+with a narrower band (+2% to +7%). Those numbers are not reported here because
+they were produced by code that is not the code in this repository — a baseline
+recorded against a different implementation is a different experiment. That the
+two agree on direction and ordering is corroboration; that they disagree on the
+band by a few points is the honest noise floor of a three-round run.
+
+**Request counts reconcile exactly against the corpus**, which matters more than
+the timings: post (2,000 rows) at page 50 is 40 full pages plus one empty probe,
+plus one request each for the four small collections = 45. The same arithmetic
+lands on 25, 9 and 7.
+
+**The empty probe is a deliberate one-request-per-collection cost.** A full page
+might be the last one, and finding out costs one more request. The alternative —
+asking for `meta.total_count` on every page — trades one request per *collection*
+for a count query per *page*. Only a collection whose row count is an exact
+multiple of the page size pays it; here that is one request out of 7.
+
+## 2. The deploy diff's remote listing cost
+
+2,322 objects in a real bucket. Phase 2 could not measure this at all — a
+directory target lists for free — so the figure quoted there (~25 requests,
+~7.5s at 300ms RTT for a 24,449-object site) was a model resting on an assumed
+1,000-objects-per-page cap.
+
+| RTT | page size | objects | requests | wall (spread) | median | per request |
+|---:|---:|---:|---:|---|---:|---:|
+| 0ms | 100 | 2322 | 24 | 147ms–398ms | 364ms | 15ms |
+| 0ms | 500 | 2322 | 5 | 109ms–132ms | 117ms | 23ms |
+| 0ms | 1000 | 2322 | 3 | 86ms–97ms | 94ms | 31ms |
+| 25ms | 100 | 2322 | 24 | 731ms–774ms | 766ms | 32ms |
+| 25ms | 500 | 2322 | 5 | 233ms–268ms | 240ms | 48ms |
+| 25ms | 1000 | 2322 | 3 | 157ms–167ms | 159ms | 53ms |
+| 100ms | 100 | 2322 | 24 | 2.50s–2.51s | 2.50s | 104ms |
+| 100ms | 500 | 2322 | 5 | 569ms–577ms | 569ms | 114ms |
+| 100ms | 1000 | 2322 | 3 | 380ms–382ms | 381ms | 127ms |
+
+**Same lever as sync, same shape.** Request count dominates: at 100ms RTT,
+100-per-page costs 2.50s against 381ms at 1000-per-page. Nothing here is
+surprising, which is the point — the assumption Phase 2 wrote down was right, and
+it is now measured rather than assumed.
+
+**Per-request cost rises with page size and per-object cost falls.** At 0ms RTT a
+100-object page costs 15ms and a 1000-object page costs 31ms, so local work per
+object drops from 0.15ms to 0.031ms. Bigger pages win twice: fewer round trips
+*and* less parsing overhead per object. The one wide spread in the table
+(147ms–398ms at 0ms/100) is the first-round cost of establishing connections,
+visible only where there is no injected latency to swamp it.
+
+**Extrapolated to Phase 0 scale, clearly labelled as extrapolation.** At
+1,000-per-page a 24,449-object site is 25 requests. Taking the measured
+127ms/request at 100ms RTT gives ~3.2s, and the ~27ms local component implies
+~8.2s at 300ms RTT — against Phase 2's modelled ~7.5s. The model was sound. What
+this does *not* measure is a provider that paginates differently, throttles
+listings, or charges for them.
+
+**Reconciliation: every configuration listed 2,322 objects.** Page size changes
+the request count and nothing else. Had that column varied, the continuation-token
+loop would be wrong and the timings would be describing a broken listing.
+
+## What these two measurements do not settle
+
+The stack is real software but it is local, unloaded, single-tenant and
+unauthenticated in the ways that matter. Untouched by any of the above: a
+provider's rate limiter under sustained load, replica lag between a write and the
+read that follows it, a listing API that caps or charges differently, credential
+rotation mid-sync, and the tail of a real network. Injected faults are the faults
+that were anticipated, and anticipated faults are the ones already handled.

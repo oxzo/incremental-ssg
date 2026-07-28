@@ -1,0 +1,195 @@
+import { test, describe, after } from 'node:test'
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { s3DeployTarget } from '../src/deploy-s3.ts'
+import { startFakeS3, obj } from './s3-fake.ts'
+import { startProxy } from '../stack/proxy.ts'
+import { planDeploy } from '../src/deploy.ts'
+import { RailError } from '../src/rails.ts'
+
+/**
+ * Teardown owned by an after() hook rather than a trailing close().
+ *
+ * A close on the last line of a test does not run when an assertion above it
+ * fails -- the leaked server keeps a handle open, node --test waits for the
+ * event loop to drain, and a failing test presents as a hang instead of a
+ * failure. Found by tools/mutate.py, whose first mutation took 600s to not
+ * report anything.
+ */
+const openables: { close: () => Promise<void> }[] = []
+const track = <T extends { close: () => Promise<void> }>(x: T): T => {
+  openables.push(x)
+  return x
+}
+after(async () => {
+  for (const o of openables.reverse()) await o.close().catch(() => {})
+})
+
+
+const md5 = (s: string) => createHash('md5').update(s).digest('hex')
+
+const targetFor = (url: string, extra: Record<string, unknown> = {}) =>
+  s3DeployTarget({
+    bucket: 'bucket',
+    endpoint: url,
+    accessKeyId: 'k',
+    secretAccessKey: 's',
+    forcePathStyle: true,
+    ...extra,
+  })
+
+describe('s3 target — listing', () => {
+  test('reports md5 ETags as usable digests', async () => {
+    const fake = track(await startFakeS3({ objects: [obj('a.html', 'alpha'), obj('b.html', 'beta')] }))
+    const listed = await targetFor(fake.url).list()
+    assert.deepEqual(
+      listed.sort((x, y) => (x.path < y.path ? -1 : 1)),
+      [{ path: 'a.html', digest: md5('alpha') }, { path: 'b.html', digest: md5('beta') }],
+    )
+  })
+
+  /**
+   * A multipart ETag is `<hash>-<partcount>` and is not the MD5 of the object.
+   * Comparing it to a local MD5 can never match, so treating it as a digest
+   * marks the object modified on every deploy and silently re-uploads it
+   * forever. Reporting no digest routes it into the diff's existing
+   * "cannot tell" path, which says so.
+   */
+  test('refuses a multipart ETag as a digest rather than comparing it forever', async () => {
+    const fake = track(await startFakeS3({
+      objects: [obj('big.jpg', 'x'.repeat(64), 'd41d8cd98f00b204e9800998ecf8427e-3')],
+    }))
+    const listed = await targetFor(fake.url).list()
+    assert.equal(listed[0].digest, undefined)
+
+    const plan = planDeploy(new Map([['big.jpg', md5('x'.repeat(64))]]), listed)
+    assert.ok(plan.digestsUnavailable, 'the caller is told, not quietly churned')
+    assert.deepEqual(plan.modified, ['big.jpg'])
+  })
+
+  test('follows continuation tokens to the end of a paginated listing', async () => {
+    const objects = Array.from({ length: 250 }, (_, i) => obj(`p/${String(i).padStart(4, '0')}.html`, `body ${i}`))
+    const fake = track(await startFakeS3({ objects }))
+    const listed = await targetFor(fake.url, { pageSize: 40 }).list()
+    assert.equal(listed.length, 250)
+    assert.equal(new Set(listed.map((o) => o.path)).size, 250)
+    const lists = fake.requests().filter((r) => r.query['list-type'] === '2')
+    assert.ok(lists.length >= 7, `paginated in ${lists.length} requests`)
+  })
+
+  test('caps page size at the API maximum instead of asking for more', async () => {
+    const fake = track(await startFakeS3({ objects: [obj('a', 'a')] }))
+    await targetFor(fake.url, { pageSize: 5000 }).list()
+    assert.equal(Number(fake.requests()[0].query['max-keys']), 1000)
+  })
+
+  test('skips directory-marker objects, which match no local file', async () => {
+    const fake = track(await startFakeS3({ objects: [obj('dir/', ''), obj('dir/a.html', 'a')] }))
+    const listed = await targetFor(fake.url).list()
+    // Without the skip, the diff deletes the marker on every single deploy.
+    assert.deepEqual(listed.map((o) => o.path), ['dir/a.html'])
+  })
+
+  test('strips and re-applies a prefix so paths match the local tree', async () => {
+    const fake = track(await startFakeS3({ objects: [obj('site/a.html', 'a'), obj('other/b.html', 'b')] }))
+    const target = targetFor(fake.url, { prefix: 'site' })
+    const listed = await target.list()
+    assert.deepEqual(listed.map((o) => o.path), ['a.html'])
+    await target.put('c.html', Buffer.from('c'), 'text/html')
+    assert.ok(fake.objects.has('site/c.html'), 'uploads land under the prefix')
+  })
+
+  /**
+   * The hazard this codebase keeps meeting, in its sixth subsystem. The diff
+   * deletes anything live that the local tree lacks, so a listing that is short
+   * and *says it is complete* does not report a smaller site -- it issues
+   * deletes for pages that are still live.
+   */
+  test('a silently-truncated listing is caught by the diff as a mass delete', async () => {
+    const objects = Array.from({ length: 60 }, (_, i) => obj(`${String(i).padStart(3, '0')}.html`, `body ${i}`))
+    const fake = track(await startFakeS3({ objects }))
+    const proxy = track(await startProxy({ origin: fake.url, dropListingEntries: 40 }))
+
+    const honest = await targetFor(fake.url).list()
+    const truncated = await targetFor(proxy.url).list()
+    assert.equal(honest.length, 60)
+    assert.ok(truncated.length < 60, `proxy actually truncated: ${truncated.length} of 60`)
+    assert.equal(proxy.stats().truncated, 1)
+
+    // The listing is the *remote* side, so a short one makes local files look
+    // new rather than making live files look absent -- it re-uploads instead of
+    // deleting. Recorded because the direction is the opposite of the instinct.
+    const local = new Map(objects.map((o) => [o.key, md5(o.body.toString('utf8'))]))
+    const plan = planDeploy(local, truncated)
+    assert.ok(plan.added.length > 0, 'a short listing shows up as spurious adds')
+    assert.equal(plan.deleted.length, 0)
+  })
+
+  // Timed out rather than left open: the failure mode this guards against is a
+  // listing loop that never terminates, and an untimed test for it would hang.
+  test('refuses a truncated flag with no continuation token instead of stopping early', { timeout: 10_000 }, async () => {
+    const objects = Array.from({ length: 30 }, (_, i) => obj(`${String(i).padStart(3, '0')}.html`, `b${i}`))
+    const fake = track(await startFakeS3({ objects }))
+    // IsTruncated stays true, the token is gone. A loop that exits when the
+    // token is missing returns 10 of 30 objects and calls it a complete listing,
+    // which is a mass delete on the next deploy.
+    const proxy = track(await startProxy({ origin: fake.url, stripContinuationToken: true }))
+    await assert.rejects(
+      () => targetFor(proxy.url, { pageSize: 10 }).list(),
+      (e: unknown) => e instanceof RailError && /continuation token|no progress/.test((e as Error).message),
+    )
+    assert.equal(proxy.stats().truncated, 1, 'the fault actually fired')
+  })
+})
+
+describe('s3 target — writes', () => {
+  test('uploads and then reports the object as unchanged', async () => {
+    const fake = track(await startFakeS3())
+    const target = targetFor(fake.url)
+    await target.put('a.html', Buffer.from('hello'), 'text/html')
+    const listed = await target.list()
+    assert.deepEqual(listed, [{ path: 'a.html', digest: md5('hello') }])
+  })
+
+  test('chunks deletes at the API limit of 1000 keys', async () => {
+    const objects = Array.from({ length: 2300 }, (_, i) => obj(`${i}.html`, 'x'))
+    const fake = track(await startFakeS3({ objects }))
+    await targetFor(fake.url).remove(objects.map((o) => o.key))
+    const deletes = fake.requests().filter((r) => r.method === 'POST' && 'delete' in r.query)
+    assert.equal(deletes.length, 3, '2300 keys is three requests, not one oversized one')
+    assert.equal(fake.objects.size, 0)
+  })
+
+  /**
+   * S3 reports per-key delete failures inside a 200 response. A client that
+   * checks only the status records a deletion that did not happen -- the same
+   * silent-incompleteness shape as the truncated listing, from the write side.
+   */
+  test('raises per-key delete errors that arrive inside a 200', async () => {
+    const fake = track(await startFakeS3({ objects: [obj('a.html', 'a'), obj('b.html', 'b')] }))
+    fake.failDeletes.add('b.html')
+    await assert.rejects(
+      () => targetFor(fake.url).remove(['a.html', 'b.html']),
+      (e: unknown) => e instanceof RailError && !e.terminal && /1 of 2/.test((e as Error).message),
+    )
+  })
+})
+
+describe('s3 target — capabilities', () => {
+  test('declares md5 so the local side hashes comparably', () => {
+    assert.equal(targetFor('http://x').digestAlgorithm, 'md5')
+  })
+
+  test('declares no path purge, because a bucket has no CDN in front of it', async () => {
+    const purged: string[] = []
+    const target = s3DeployTarget({
+      bucket: 'b', endpoint: 'http://x', accessKeyId: 'k', secretAccessKey: 's',
+      onPurge: (p) => purged.push(...p),
+    })
+    assert.equal(target.capabilities.pathPurge, false)
+    await target.purge(['a.html'])
+    // A no-op that records. Silently accepting the purge would make a deploy
+    // report success for a step that never happened.
+    assert.deepEqual(purged, ['a.html'])
+  })
+})

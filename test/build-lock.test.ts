@@ -138,44 +138,96 @@ describe('build lock', () => {
   })
 
   /**
-   * The property the file lock exists for, tested across real processes.
+   * The property the file lock exists for, tested across real processes: no two
+   * writers hold it at once -- NOT that exactly one of them wins.
    *
-   * Repeated, deliberately -- this project's own Phase 1 lesson is that a green
-   * concurrency test is one sample of a race, and the temp-filename collision in
-   * AssetCache passed by coin flip for an entire phase.
+   * The winner count was the original assertion and it was wrong. It fails under
+   * load for a reason that has nothing to do with the lock: once the box is busy
+   * enough that process startup spreads wider than the hold, the first racer
+   * releases before the last one starts, so two racers win having never
+   * overlapped. Measured while chasing exactly that failure -- every 2-winner
+   * round had a spawn spread of 40-45ms against a 40ms hold, every 1-winner round
+   * had a spread of 0ms, and across 40 rounds under deliberate CPU load there was
+   * not one overlapping interval. The old assertion was measuring the scheduler.
    *
-   * What this test does NOT establish, stated because a passing concurrency test
-   * invites the opposite assumption. The first version of acquireLock created the
-   * lock with `wx` and filled it in a second syscall, leaving a window where the
-   * file exists and is empty -- a racer reading it there finds unparseable JSON,
-   * judges the lock corrupt, deletes it, and takes a lock someone else holds.
-   * That version passes this test. It was checked, not assumed: reverting to it
-   * and re-running gave 5 rounds of exactly one winner. The window is real but
-   * microseconds wide, while process startup jitter is tens of milliseconds, so
-   * thirty draws sample nowhere near finely enough to land inside it.
+   * That is the Phase 5 lesson arriving from the other side. There, a green
+   * concurrency test certified a fix it had no power to check; here, a red one
+   * reported a defect that did not exist. Same root cause both times: the
+   * assertion was not the property.
+   *
+   * What this test still does NOT establish, stated because a passing
+   * concurrency test invites the opposite assumption. The first version of
+   * acquireLock created the lock with `wx` and filled it in a second syscall,
+   * leaving a window where the file exists and is empty -- a racer reading it
+   * there finds unparseable JSON, judges the lock corrupt, deletes it, and takes
+   * a lock someone else holds. That version passes this test. It was checked, not
+   * assumed: reverting to it and re-running gave clean round after clean round.
+   * The window is real but microseconds wide, while process startup jitter is
+   * tens of milliseconds, so these draws sample nowhere near finely enough to
+   * land inside it.
    *
    * So the atomic staged-link in acquireLock is justified by construction rather
-   * than by this test, and the test below it -- an empty or unparseable lock file
-   * is reclaimable -- is what makes the hazard concrete: that behaviour is
-   * correct only because the file can never be observed incomplete.
+   * than by this test, and the test above -- an empty or unparseable lock file is
+   * reclaimable -- is what makes the hazard concrete: that behaviour is correct
+   * only because the file can never be observed incomplete.
    */
-  test('exactly one of six concurrent processes wins the lock, every round', async () => {
+  test('no two of six concurrent processes ever hold the lock at the same time', async () => {
     const d = work('lock-race')
-    for (let round = 0; round < 5; round++) {
+
+    async function race(holdMs: number, label: string): Promise<boolean> {
       const racers = Array.from({ length: 6 }, () => {
-        const child = spawn(process.execPath, ['--no-warnings', RACER, d, '40'], {
+        const child = spawn(process.execPath, ['--no-warnings', RACER, d, String(holdMs)], {
           stdio: ['ignore', 'pipe', 'inherit'],
         })
         let out = ''
         child.stdout.on('data', (c) => { out += String(c) })
-        return once(child, 'exit').then(() => out)
+        return once(child, 'exit').then(() => out.trim())
       })
-      const results = await Promise.all(racers)
-      const won = results.filter((r) => r.includes('won'))
-      assert.equal(won.length, 1, `round ${round}: ${won.length} winners in ${JSON.stringify(results)}`)
-      assert.match(won[0], /released true/)
-      // And the winner cleaned up after itself, so the next round starts empty.
-      assert.equal(readLock(d), null, `round ${round}: lock left behind`)
+      const results = (await Promise.all(racers)).filter(Boolean).map((r) => JSON.parse(r))
+      const held = results.filter((r) => r.lost === undefined)
+
+      assert.ok(held.length >= 1, `${label}: nobody acquired the lock -- ${JSON.stringify(results)}`)
+      for (const h of held) {
+        assert.equal(h.released, true, `${label}: pid ${h.pid} lost the lock while holding it`)
+      }
+      // The property. Everything else here is scaffolding for this loop.
+      for (let i = 0; i < held.length; i++) {
+        for (let j = i + 1; j < held.length; j++) {
+          const a = held[i]
+          const b = held[j]
+          assert.ok(
+            a.from >= b.to || b.from >= a.to,
+            `${label}: pids ${a.pid} [${a.from},${a.to}] and ${b.pid} [${b.from},${b.to}] overlapped`,
+          )
+        }
+      }
+      assert.equal(readLock(d), null, `${label}: lock left behind`)
+      // One winner means the other five were refused while it held -- the only
+      // outcome that exercised mutual exclusion at all. More than one means the
+      // hold expired before the last racer started, so that round measured
+      // sequential acquisition and proves nothing about the lock.
+      return held.length === 1
     }
+
+    // The hold escalates until a round is genuinely contended.
+    //
+    // A fixed hold cannot work when the load is not known in advance: too short
+    // and every round serialises, so the test passes while testing nothing;
+    // assert against that and it fails on a busy box for reasons that have
+    // nothing to do with the lock. Both are the same defect this test already
+    // had once -- the assertion not being the property. Escalating measures the
+    // box rather than assuming it.
+    let contended = false
+    for (const holdMs of [40, 200, 800]) {
+      for (let i = 0; i < 3 && !contended; i++) {
+        contended = await race(holdMs, `hold ${holdMs}ms round ${i}`)
+      }
+      if (contended) break
+    }
+    assert.ok(
+      contended,
+      'six processes never overlapped even with an 800ms hold -- this box is too loaded for the ' +
+      'test to say anything about mutual exclusion, which is different from the lock being wrong',
+    )
   })
 })

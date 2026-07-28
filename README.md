@@ -270,11 +270,39 @@ while document *shapes* barely differ at all:
 3. revision identifiers in webhooks — absent, no read-after-write check (the
    service says so rather than running a check that cannot mean anything)
 
-`capabilities` is data the sync driver branches on. No real CMS has been chosen
-yet; `src/cms-mock.ts` is currently the only target.
+`capabilities` is data the sync driver branches on.
 
 **Page size is the dominant sync lever**, not delta sync: at 300ms round-trip,
 50-per-page costs 125s where 500-per-page costs 13s.
+
+### Real adapters, and the local stack behind them
+
+Both ends now have a real implementation as well as a mock. `stack/` stands up
+**Directus** and **MinIO** in podman containers, with a fault-injecting proxy in
+front of both so the adapters meet rate limits, truncated listings, aborted
+responses and swept round-trip time without needing a hosted service or a bad
+day. Full account, including what a local stack does *not* buy, in
+`stack/README.md`.
+
+Three things the real Directus does that the mock never did, each of which
+silently breaks the obvious implementation:
+
+- `date_updated` is **null until a document is updated**, so a delta filter on
+  it alone misses every newly created document. The filter names both timestamp
+  columns.
+- `_gt` is **rejected on string fields**, so keyset pagination needs an integer
+  key. Offset pagination is not a safe fallback here: after a full pull the sync
+  driver feeds the ids it saw into `DocumentStore.deleteMissing`, so a page that
+  drifts mid-pull does not merely skip a document, it unpublishes it.
+- Webhooks were **removed in Directus 12**; Flows replace them and deliver three
+  different payload shapes across create, update and delete. A flow written the
+  obvious way works for updates and sends nothing at all for creates.
+
+On the deploy side the S3 target uses `@aws-sdk/client-s3`, so the same code
+points at S3 or R2 by changing an endpoint and a credential pair. The one
+non-obvious rule: a **multipart ETag is not the MD5 of the object**, so it is
+reported as no-digest rather than compared — otherwise every multipart-uploaded
+object reads as modified on every deploy, forever.
 
 ## Layout
 
@@ -283,6 +311,8 @@ yet; `src/cms-mock.ts` is currently the only target.
 | `src/config.ts` | the `SiteConfig` seam and the site loader |
 | `src/store.ts` | SQLite document mirror (see the `(type, id)` index comment) |
 | `src/cms.ts`, `src/cms-mock.ts` | adapter interface, HTTP adapter, mock CMS |
+| `src/cms-directus.ts` | the real CMS adapter, and its retry and wait budgets |
+| `src/deploy-s3.ts` | the real deploy target, over the S3 API |
 | `src/sync.ts` | full/delta pull, hashing, delete reconciliation |
 | `src/assets.ts`, `src/asset-cache.ts` | the asset stage and its cache |
 | `src/determinism.ts` | the render-window guard |
@@ -296,7 +326,9 @@ yet; `src/cms-mock.ts` is currently the only target.
 | `src/webhook.ts` | the HTTP endpoint, its auth, and its body cap |
 | `src/cli.ts` | `sync`, `build`, `deploy`, and `serve` commands |
 | `example/blog/` | the example site, its sample corpus, and `demo.ts` |
-| `bench/` | Phase 0 / 2b / 2c harnesses and `RESULTS.md` |
+| `stack/` | the local Directus + MinIO stack, its seeding, and the fault proxy |
+| `tools/mutate.py` | breaks each rail in turn and checks that a test notices |
+| `bench/` | Phase 0 / 2b / 2c / adapter harnesses and `RESULTS.md` |
 
 ## Not built
 
@@ -308,10 +340,12 @@ justifies revisiting.
 Sync tuning (Phase 2d) turned out to be already built: page size is a caller
 option, delta pull runs off a persisted watermark, and the full-ID reconcile
 scan catches deletes — all three landed inside the Phase 1 sync driver and are
-tested there. What it left undone is *tuning against a real network*; every sync
-number in `bench/RESULTS.md` comes from a mock on localhost, where round-trip
-time is meaningless.
+tested there. What it left undone was *tuning against a real network*, and
+`bench/run-adapters.ts` closes that: the page-size lever and the deploy diff's
+listing cost are now measured against real services across a swept round-trip
+time rather than modelled from a mock on localhost.
 
-Next: a real adapter on both ends — a real CMS and a real deploy target — which
-is where auth, rate limiting, pagination caps, and per-request latency finally
-show up. Everything upstream of that is built.
+What remains genuinely unmeasured is a **hosted** service — real auth against a
+real identity provider, a real provider's rate limits, a real replica's lag, and
+a real CDN purge. Every failure the local stack injects is one that was
+anticipated, and anticipated failures are the ones already handled.
