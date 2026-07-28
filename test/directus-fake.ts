@@ -67,6 +67,13 @@ export async function startFakeDirectus(
      * the suite can produce a response shaped like this.
      */
     omitMeta?: boolean
+    /**
+     * Cap every listing at this many rows, the way Directus's QUERY_LIMIT_MAX
+     * does -- including `limit=-1`, which is the whole point. The count in
+     * `meta` still reports the true total, because that is what makes the
+     * truncation detectable and what makes it silent without a check.
+     */
+    queryLimitMax?: number
   } = {},
 ): Promise<FakeDirectus> {
   const token = opts.token ?? 'fake-token'
@@ -105,6 +112,10 @@ export async function startFakeDirectus(
     out.sort((a, b) => a.seq - b.seq)
     const limit = Number(query.limit ?? '100')
     if (limit >= 0) out = out.slice(0, limit)
+    // Applied after the caller's own limit and to `-1` as well, which is the
+    // case a cap makes dangerous: the request that asked for everything is the
+    // one that silently gets less.
+    if (opts.queryLimitMax !== undefined) out = out.slice(0, opts.queryLimitMax)
     // `fields` is honoured because the id-listing path depends on it being cheap;
     // a fake that returned whole bodies would hide a regression there.
     if (query.fields) {

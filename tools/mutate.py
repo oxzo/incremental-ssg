@@ -490,9 +490,27 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "directus-count-not-requested",
         "src/cms-directus.ts",
-        "        meta: 'filter_count',",
-        "        meta: '',",
+        # Anchored on the line above, because listIds() now asks for the same
+        # meta one indent deeper -- and this string is a substring of that one.
+        "        filter: JSON.stringify(filter),\n        meta: 'filter_count',",
+        "        filter: JSON.stringify(filter),\n        meta: '',",
         "the count is never asked for, so every listing reports no total and the completeness check silently does nothing",
+        "test/cms-directus.test.ts",
+    ),
+    Mutation(
+        "directus-truncated-listing-accepted",
+        "src/cms-directus.ts",
+        "        if (Number.isFinite(count) && rows.length < count) {",
+        "        if (false) {",
+        "a server-side listing cap truncates the id listing silently, and deleteMissing reads the missing ids as deletions",
+        "test/cms-directus.test.ts",
+    ),
+    Mutation(
+        "directus-truncation-counts-kept-ids",
+        "src/cms-directus.ts",
+        "        if (Number.isFinite(count) && rows.length < count) {",
+        "        if (Number.isFinite(count) && out.length < count) {",
+        "rows with an unusable doc_id are dropped on purpose, so counting kept ids refuses a listing that was complete",
         "test/cms-directus.test.ts",
     ),
     # --- draining a pool before reporting that it failed ----------------------

@@ -364,12 +364,51 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
      * Every id, no bodies. This is the only thing that catches deletes, and after
      * a delta pull it is also the only check on whether the delta was complete.
      */
+    /**
+     * The complete id listing, and the one place a cap would be invisible.
+     *
+     * `limit=-1` asks Directus for everything, and until this check existed
+     * nothing verified it got everything: one request per collection, no
+     * pagination loop, and the result goes straight into
+     * DocumentStore.deleteMissing on the delta path. A deployment setting
+     * QUERY_LIMIT_MAX silently truncates the answer, and a truncated id listing
+     * is indistinguishable from a mass deletion -- guarded only by the ratio
+     * ceiling, which passes anything under half.
+     *
+     * Measured against the live stack before this was written: every collection
+     * returns exactly its filter_count, so it was correct and unverifiable at
+     * the same time. stack/up.sh names listing caps among the things six phases
+     * against mocks never exercised; this is one of them.
+     *
+     * Compared on rows returned rather than ids kept, because the loop below
+     * legitimately drops rows with an unusable doc_id. Counting those as missing
+     * would refuse a listing that was complete.
+     */
     async listIds() {
       const out: { id: string; revision: string }[] = []
       for (const { collection } of cols) {
-        const qs = new URLSearchParams({ limit: '-1', fields: 'doc_id,date_updated,date_created', sort: 'seq' })
+        const qs = new URLSearchParams({
+          limit: '-1',
+          fields: 'doc_id,date_updated,date_created',
+          sort: 'seq',
+          meta: 'filter_count',
+        })
         const body = await request(`/items/${collection}?${qs}`)
-        for (const row of (body?.data ?? []) as Row[]) {
+        const rows = (body?.data ?? []) as Row[]
+        const count = Number(body?.meta?.filter_count)
+        // No count, no check -- same rule as CmsPage.total. A server that will
+        // not say how many there are cannot be caught lying about it, and
+        // guessing refuses correct listings.
+        if (Number.isFinite(count) && rows.length < count) {
+          throw new RailError(
+            'cms.listing-truncated',
+            false,
+            `${collection} reports ${count} documents and the id listing returned ${rows.length}. ` +
+            `Refused: this listing decides which documents still exist, so a truncated one reads ` +
+            `as ${count - rows.length} deletions. A server-side listing cap (Directus ` +
+            `QUERY_LIMIT_MAX) is the likely cause; raise it or lower the corpus.`)
+        }
+        for (const row of rows) {
           const id = row.doc_id
           if (typeof id !== 'string' || id === '') continue
           out.push({ id, revision: (row.date_updated as string) ?? (row.date_created as string) ?? '' })

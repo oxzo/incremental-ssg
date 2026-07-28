@@ -424,3 +424,52 @@ describe('directus adapter — the listing count', () => {
     assert.ok(items.every((r) => r.query.meta === 'filter_count'))
   })
 })
+
+// The id listing is one request per collection at limit=-1, with no pagination
+// loop, and its result goes straight into deleteMissing on the delta path. A
+// server-side cap truncates it silently, and a truncated id listing is
+// indistinguishable from a mass deletion.
+describe('directus adapter — a truncated id listing', () => {
+  test('a server cap is refused rather than reconciled', async () => {
+    const fake = track(await startFakeDirectus(fakeRows({ post: 40 }), { queryLimitMax: 25 }))
+    const adapter = adapterFor(fake.url, ['post'])
+    await assert.rejects(
+      () => adapter.listIds(),
+      (e: Error) => {
+        assert.ok(e instanceof RailError)
+        assert.equal(e.rail, 'cms.listing-truncated')
+        assert.equal(e.terminal, false)
+        assert.match(e.message, /reports 40 documents and the id listing returned 25/)
+        return true
+      })
+  })
+
+  test('an uncapped listing is not refused', async () => {
+    // The negative control, and it needs the cap option absent rather than set
+    // high: a rail that refused every listing would pass the test above.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 40, tag: 3 })))
+    const adapter = adapterFor(fake.url, ['post', 'tag'])
+    const ids = await adapter.listIds()
+    assert.equal(ids.length, 43)
+  })
+
+  test('rows with an unusable doc_id are dropped without being read as missing', async () => {
+    // listIds skips rows whose doc_id is empty or not a string, so the kept
+    // count is legitimately lower than the returned count. Comparing the wrong
+    // one of those two against filter_count refuses a complete listing.
+    const rows = fakeRows({ post: 5 })
+    rows.get('post')![1].doc_id = ''
+    rows.get('post')![3].doc_id = null
+    const fake = track(await startFakeDirectus(rows))
+    const adapter = adapterFor(fake.url, ['post'])
+    const ids = await adapter.listIds()
+    assert.equal(ids.length, 3, 'the two unusable rows are dropped')
+  })
+
+  test('a listing with no count is not checked rather than refused', async () => {
+    const fake = track(await startFakeDirectus(fakeRows({ post: 40 }), { omitMeta: true, queryLimitMax: 25 }))
+    const adapter = adapterFor(fake.url, ['post'])
+    const ids = await adapter.listIds()
+    assert.equal(ids.length, 25, 'no count means no check — the old behaviour, stated')
+  })
+})
