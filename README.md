@@ -375,7 +375,7 @@ object reads as modified on every deploy, forever.
 ## Checks
 
 ```sh
-npm test           # 267 tests
+npm test           # 268 tests
 npm run typecheck  # tsc, strict, no emit — Node strips types and checks nothing
 npm run test:mutate  # break each rail in turn; every one must fail a test
 npm audit --omit=dev

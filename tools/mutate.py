@@ -218,9 +218,20 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "s3-page-size-uncapped",
         "src/deploy-s3.ts",
-        "const pageSize = Math.min(opts.pageSize ?? 1000, 1000)",
-        "const pageSize = opts.pageSize ?? 1000",
+        "Math.min(\n    checkNumber(opts.pageSize, 1000, { name: 'pageSize', min: 1, integer: true }),\n    1000,\n  )",
+        "checkNumber(opts.pageSize, 1000, { name: 'pageSize', min: 1, integer: true })",
         "the ListObjectsV2 API caps MaxKeys at 1000 regardless of what is asked",
+        "test/deploy-s3.test.ts",
+    ),
+    # The shape this line had before, which is the shape A2 named and this
+    # subsystem kept: a clamp is transparent to NaN, so it reads as a validation
+    # and is not one.
+    Mutation(
+        "s3-page-size-nan-accepted",
+        "src/deploy-s3.ts",
+        "checkNumber(opts.pageSize, 1000, { name: 'pageSize', min: 1, integer: true })",
+        "(opts.pageSize ?? 1000)",
+        "MaxKeys: NaN lists zero objects and reports the listing complete, which the diff answers with a full re-upload",
         "test/deploy-s3.test.ts",
     ),
     # --- the crash window inside sync ------------------------------------------

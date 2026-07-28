@@ -83,6 +83,29 @@ describe('s3 target — listing', () => {
     assert.equal(Number(fake.requests()[0].query['max-keys']), 1000)
   })
 
+  /**
+   * Above the API ceiling is clamped; unparseable is refused. The two are not
+   * the same kind of wrong, and the clamp cannot tell them apart on its own --
+   * Math.min(NaN, 1000) is NaN.
+   *
+   * Measured before it was fixed: MaxKeys: NaN listed zero of twenty-five
+   * objects and reported the listing complete. The deploy diff reads an empty
+   * remote as a site that needs uploading rather than one that needs deleting,
+   * so the visible symptom is a full re-upload on every deploy and no refusal
+   * anywhere -- which is the same silence the delete-ratio rail was built to
+   * break.
+   */
+  test('refuses a page size that failed to parse, rather than clamping it to NaN', () => {
+    for (const bad of [NaN, 0, -10, 2.5, Infinity]) {
+      assert.throws(
+        () => targetFor('http://127.0.0.1:1', { pageSize: bad }),
+        (e: unknown) => e instanceof RailError && e.terminal && /pageSize/.test((e as Error).message),
+        `pageSize ${bad} was accepted`,
+      )
+    }
+    assert.equal(targetFor('http://127.0.0.1:1', { pageSize: undefined }).name, 's3:bucket')
+  })
+
   test('skips directory-marker objects, which match no local file', async () => {
     const fake = track(await startFakeS3({ objects: [obj('dir/', ''), obj('dir/a.html', 'a')] }))
     const listed = await targetFor(fake.url).list()

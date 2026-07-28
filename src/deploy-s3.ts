@@ -79,7 +79,21 @@ export function s3DeployTarget(opts: S3TargetOptions): DeployTarget {
   const prefix = (opts.prefix ?? '').replace(/^\/+|\/+$/g, '')
   const key = (path: string) => (prefix === '' ? path : `${prefix}/${path}`)
   const unkey = (k: string) => (prefix === '' ? k : k.slice(prefix.length + 1))
-  const pageSize = Math.min(opts.pageSize ?? 1000, 1000)
+  // Checked and then clamped, which is the opposite order from every other
+  // number in this codebase and is deliberate. 1000 is the API's own ceiling
+  // rather than a policy this project chose, so asking for more is answered by
+  // the protocol and not refused here. An unparsed pageSize is a different
+  // thing and does have to be refused: Math.min(NaN, 1000) is NaN, so the clamp
+  // that looks like it validates does not -- the A2 shape, in a subsystem that
+  // sweep did not reach because no CLI flag points at it.
+  //
+  // Measured against test/s3-fake.ts rather than assumed: MaxKeys: NaN lists
+  // zero of twenty-five objects and reports the listing complete, which the
+  // deploy diff reads as an empty bucket and answers with a full re-upload.
+  const pageSize = Math.min(
+    checkNumber(opts.pageSize, 1000, { name: 'pageSize', min: 1, integer: true }),
+    1000,
+  )
   const maxListRequests = checkNumber(opts.maxListRequests, 10_000, {
     name: 'maxListRequests',
     min: 1,
