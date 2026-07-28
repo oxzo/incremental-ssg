@@ -1,7 +1,7 @@
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { DocumentStore, STORE_SCHEMA, documentIdentity } from '../src/store.ts'
+import { DocumentStore, STORE_SCHEMA, documentIdentity, documentKey } from '../src/store.ts'
 import { tmpdir, cleanup } from './fixture.ts'
 
 const dirs: string[] = []
@@ -87,22 +87,32 @@ describe('DocumentStore', () => {
     // map reported as no change at all.
     assert.deepEqual(
       [...s.identities().entries()].sort(),
-      [['a', documentIdentity('post', 'h-a')], ['b', documentIdentity('page', 'h-b')]])
+      [[documentKey('post', 'a'), documentIdentity('post', 'h-a')],
+       [documentKey('page', 'b'), documentIdentity('page', 'h-b')]].sort())
     s.close()
   })
 
   test('deleteMissing drops documents the CMS no longer lists', () => {
     const s = new DocumentStore(fresh())
     s.upsertMany([doc('a', 'post'), doc('b', 'post'), doc('c', 'post'), doc('d', 'post')])
-    assert.equal(s.deleteMissing(new Set(['a', 'b', 'c'])), 1)
-    assert.deepEqual([...s.ids()].sort(), ['a', 'b', 'c'])
+    assert.equal(s.deleteMissing(live('a', 'b', 'c')), 1)
+    assert.deepEqual([...s.refs()].map((r) => r.id).sort(), ['a', 'b', 'c'])
     s.close()
   })
+
+  /**
+   * A live set holds composite keys, because that is what identifies a document
+   * now. Spelled through a helper rather than inline: passing bare ids here
+   * still "works" in the sense that the rail fires -- every key mismatches, so
+   * every document looks missing -- which is a test passing for a reason that
+   * has nothing to do with what it claims to check.
+   */
+  const live = (...ids: string[]) => new Set(ids.map((i) => documentKey('post', i)))
 
   test('deleteMissing is a no-op when nothing is missing', () => {
     const s = new DocumentStore(fresh())
     s.upsertMany([doc('a', 'post'), doc('b', 'post')])
-    assert.equal(s.deleteMissing(new Set(['a', 'b'])), 0)
+    assert.equal(s.deleteMissing(live('a', 'b')), 0)
     s.close()
   })
 
@@ -112,7 +122,7 @@ describe('DocumentStore', () => {
     // every log line still says "sync complete".
     const s = new DocumentStore(fresh())
     s.upsertMany([doc('a', 'post'), doc('b', 'post'), doc('c', 'post'), doc('d', 'post')])
-    assert.throws(() => s.deleteMissing(new Set(['a'])), /over the 50% limit/)
+    assert.throws(() => s.deleteMissing(live('a')), /over the 50% limit/)
     assert.equal(s.count(), 4, 'nothing may be deleted when the guard trips')
     s.close()
   })
@@ -120,7 +130,7 @@ describe('DocumentStore', () => {
   test('deleteMissing allows a large sweep when it is explicitly intended', () => {
     const s = new DocumentStore(fresh())
     s.upsertMany([doc('a', 'post'), doc('b', 'post'), doc('c', 'post'), doc('d', 'post')])
-    assert.equal(s.deleteMissing(new Set(['a']), { force: true }), 3)
+    assert.equal(s.deleteMissing(live('a'), { force: true }), 3)
     assert.equal(s.count(), 1)
     s.close()
   })
@@ -136,5 +146,60 @@ describe('DocumentStore', () => {
     const readers = Array.from({ length: 8 }, () => new DocumentStore(p, { readOnly: true }))
     for (const r of readers) assert.equal(r.count(), 1)
     readers.forEach((r) => r.close())
+  })
+})
+
+describe('DocumentStore — (type, id) is the key', () => {
+  test('the same id under two types is two documents', () => {
+    const s = new DocumentStore(fresh())
+    s.upsertMany([doc('shared', 'post'), doc('shared', 'page')])
+    assert.equal(s.count(), 2)
+    assert.deepEqual(
+      s.refs().map((r) => `${r.type}/${r.id}`).sort(),
+      ['page/shared', 'post/shared'])
+    s.close()
+  })
+
+  test('the same id under one type is one document, updated in place', () => {
+    // The other half of the key: it must still be a key. Two upserts of the same
+    // (type, id) is an update, not a second row.
+    const s = new DocumentStore(fresh())
+    s.upsertMany([doc('a', 'post')])
+    s.upsertMany([{ ...doc('a', 'post'), hash: 'h2', revision: 'r2' }])
+    assert.equal(s.count(), 1)
+    assert.equal(s.revisionOf('post', 'a'), 'r2')
+    s.close()
+  })
+
+  test('revisionOf answers for the named type only', () => {
+    // The read-after-write check calls this. Answering for whichever document
+    // happened to share the id would report the mirror caught up when it had
+    // not, or never caught up at all.
+    const s = new DocumentStore(fresh())
+    s.upsertMany([{ ...doc('shared', 'post'), revision: 'rp' }, { ...doc('shared', 'page'), revision: 'rg' }])
+    assert.equal(s.revisionOf('post', 'shared'), 'rp')
+    assert.equal(s.revisionOf('page', 'shared'), 'rg')
+    assert.equal(s.revisionOf('author', 'shared'), null)
+    s.close()
+  })
+
+  test('deleteIds removes one row of a shared id and leaves the other', () => {
+    const s = new DocumentStore(fresh())
+    s.upsertMany([doc('shared', 'post'), doc('shared', 'page')])
+    assert.equal(s.deleteIds([{ type: 'page', id: 'shared' }]), 1)
+    assert.deepEqual(s.refs().map((r) => `${r.type}/${r.id}`), ['post/shared'])
+    s.close()
+  })
+
+  test('a mirror written by the previous schema is refused, not silently reused', () => {
+    // The migration, such as it is. A v1 file has id as its primary key, so
+    // reusing it would keep the collision this schema exists to remove -- and
+    // the mirror is reproducible by construction, which is why the answer is to
+    // delete and re-sync rather than to rewrite the table.
+    const path = fresh()
+    const s = new DocumentStore(path)
+    s.setMeta('schema', String(STORE_SCHEMA - 1))
+    s.close()
+    assert.throws(() => new DocumentStore(path), /Delete the database and re-sync/)
   })
 })

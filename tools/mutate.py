@@ -381,16 +381,16 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "sync-type-not-in-identity",
         "src/sync.ts",
-        "      if (known.get(item.id) !== documentIdentity(item.type, hash)) changed++",
-        "      if (known.get(item.id) !== documentIdentity('', hash)) changed++",
+        "      if (known.get(key) !== documentIdentity(item.type, hash)) changed++",
+        "      if (known.get(key) !== documentIdentity('', hash)) changed++",
         "comparing content alone reports a document that changed type as unchanged, and routes are resolved per type",
         "test/sync.test.ts",
     ),
     Mutation(
         "sync-keeps-unrendered-type",
         "src/sync.ts",
-        "        if (known.has(item.id)) unwanted.push(item.id)",
-        "        if (false) unwanted.push(item.id)",
+        "        if (known.has(key)) unwanted.push({ type: item.type, id: item.id })",
+        "        if (false) unwanted.push({ type: item.type, id: item.id })",
         "a document moved out of scope keeps its stored row, which no reconcile path can see, and its page stays published",
         "test/sync.test.ts",
     ),
@@ -441,6 +441,60 @@ MUTATIONS: list[Mutation] = [
         "    const digests = [...new Set(done.map((d) => String(d.routes)))]",
         "the shape this replaced: two workers resolving different route sets of equal length agree and the build ships the mixture",
         "test/route-plan.test.ts",
+    ),
+    # --- (type, id) is what identifies a document ------------------------------
+    #
+    # `id` alone was the primary key, and a multi-collection CMS makes that a
+    # collision rather than a key. Each of these restores one half of the old
+    # behaviour; the first two are the bug itself, and the rest are the places
+    # that had to learn the new key and could silently keep using the old one.
+    Mutation(
+        "store-key-is-id-alone",
+        "src/store.ts",
+        "        PRIMARY KEY (type, id)",
+        "        PRIMARY KEY (id)",
+        "two collections sharing a doc_id overwrite each other, and keep doing it on every sync forever",
+        "test/store.test.ts",
+    ),
+    Mutation(
+        "store-upsert-conflicts-on-id",
+        "src/store.ts",
+        "       ON CONFLICT(type,id) DO UPDATE SET",
+        "       ON CONFLICT(id) DO UPDATE SET",
+        "the upsert resolves against the wrong uniqueness, so a document with a shared id replaces the other type's row",
+        "test/store.test.ts",
+    ),
+    Mutation(
+        "store-identities-keyed-by-id",
+        "src/store.ts",
+        "    for (const r of rows) out.set(documentKey(r.type, r.id), documentIdentity(r.type, r.hash))",
+        "    for (const r of rows) out.set(r.id, documentIdentity(r.type, r.hash))",
+        "change detection compares against a map keyed differently from the one it is looked up in, so every sync reports every document as changed",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-reconcile-drops-the-type",
+        "src/sync.ts",
+        "      deleted += store.deleteMissing(new Set(live.map((l) => documentKey(l.type, l.id))), {",
+        "      deleted += store.deleteMissing(new Set(live.map((l) => l.id)), {",
+        "a reconcile built from ids alone compares them against (type, id) keys, finds every one missing, and proposes deleting the whole mirror",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-duplicate-document-accepted",
+        "src/sync.ts",
+        "      if (seen.has(key)) {",
+        "      if (false) {",
+        "two documents at one (type, id) silently overwrite each other, which the composite key does not fix and was never meant to",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "store-revision-ignores-type",
+        "src/store.ts",
+        "      .prepare('SELECT revision FROM documents WHERE type = ? AND id = ?')\n      .get(type, id) as",
+        "      .prepare('SELECT revision FROM documents WHERE id = ?')\n      .get(id) as",
+        "the read-after-write check answers for whichever document shares the id, so it reports the mirror caught up when it has not",
+        "test/store.test.ts",
     ),
     # --- the listing count, and what it is allowed to claim -------------------
     #

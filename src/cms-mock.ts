@@ -35,7 +35,7 @@ export function startMockCms(docs: MockDoc[], latencyMs = 0): Promise<MockCms> {
         // query can never return a document that is gone, so without this a
         // delete leaves an orphan page live forever.
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ ids: docs.map((d) => [d.doc.id, d.doc.rev ?? '']) }))
+        res.end(JSON.stringify({ ids: docs.map((d) => [d.doc.id, d.doc.rev ?? '', d.type]) }))
         return
       }
       const cursor = Number(url.searchParams.get('cursor') ?? 0)

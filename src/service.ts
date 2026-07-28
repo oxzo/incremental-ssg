@@ -64,7 +64,12 @@ import type { LockInfo } from './build-lock.ts'
 /** The one persisted bit: a publish is outstanding. */
 export const DIRTY_KEY = 'service:dirty'
 
-export type Expectation = { id: string; revision: string }
+/**
+ * One document the mirror is expected to catch up to, named the way the mirror
+ * names documents: (type, id). An id alone would look up whichever document
+ * happened to share it.
+ */
+export type Expectation = { type: string; id: string; revision: string }
 
 export type TriggerSource = 'webhook' | 'poll' | 'manual' | 'startup' | 'retry'
 
@@ -429,7 +434,7 @@ async function checkReadAfterWrite(
   let outstanding = trigger.expectations
   for (let attempt = 1; attempt <= o.attempts; attempt++) {
     out.attempts = attempt
-    outstanding = outstanding.filter((e) => store.revisionOf(e.id) !== e.revision)
+    outstanding = outstanding.filter((e) => store.revisionOf(e.type, e.id) !== e.revision)
     if (outstanding.length === 0) break
     if (attempt === o.attempts) break
     await sleep(o.backoffMs * attempt)

@@ -80,7 +80,7 @@ describe('service scheduling', () => {
   test('a burst of webhooks collapses into one run', async () => {
     const { service, seen } = harness({ debounceMs: 40 })
     for (let i = 0; i < 8; i++) {
-      service.notify({ source: 'webhook', expectations: [{ id: `p${i}`, revision: 'r1' }] })
+      service.notify({ source: 'webhook', expectations: [{ type: 'post', id: `p${i}`, revision: 'r1' }] })
       await sleep(5)
     }
     await service.idle()
@@ -248,13 +248,13 @@ describe('service failure handling', () => {
         if (n === 1) {
           r.readAfterWrite = {
             checked: true, expected: 1, attempts: 3, reason: 'not readable',
-            outstanding: [{ id: 'p1', revision: 'r9' }],
+            outstanding: [{ type: 'post', id: 'p1', revision: 'r9' }],
           }
         }
         return r
       },
     })
-    service.notify({ source: 'webhook', expectations: [{ id: 'p1', revision: 'r9' }] })
+    service.notify({ source: 'webhook', expectations: [{ type: 'post', id: 'p1', revision: 'r9' }] })
     await sleep(150)
     await service.idle()
     // Without this the lagging document would wait out the whole poll interval.
@@ -477,7 +477,7 @@ describe('pipeline', () => {
       post.doc.rev = 'rev-77'
 
       const r = await p.run(trigger({
-        expectations: [{ id: String(post.doc.id), revision: 'rev-77' }],
+        expectations: [{ type: 'post', id: String(post.doc.id), revision: 'rev-77' }],
       }))
       assert.equal(r.readAfterWrite.checked, true)
       assert.equal(r.readAfterWrite.outstanding.length, 0)
@@ -496,7 +496,7 @@ describe('pipeline', () => {
       // it. Refusing to publish would convert a lagging replica into a site that
       // never updates at all.
       const r = await p.run(trigger({
-        expectations: [{ id: String(post.doc.id), revision: 'rev-99-never-served' }],
+        expectations: [{ type: 'post', id: String(post.doc.id), revision: 'rev-99-never-served' }],
       }))
       assert.equal(r.readAfterWrite.checked, true)
       assert.equal(r.readAfterWrite.outstanding.length, 1)
@@ -514,7 +514,7 @@ describe('pipeline', () => {
     const p = await pipelineFor(docs, { webhookRevisions: false })
     try {
       const r = await p.run(trigger({
-        expectations: [{ id: String(docs[0].doc.id), revision: 'whatever' }],
+        expectations: [{ type: 'post', id: String(docs[0].doc.id), revision: 'whatever' }],
       }))
       // Same convention the sync driver uses for a CMS with no id listing: name
       // the missing capability rather than run a check that means nothing.

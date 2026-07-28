@@ -15,6 +15,14 @@ import type { ChildProcess } from 'node:child_process'
 
 const CRASHER = resolve(import.meta.dirname, 'sync-crasher.ts')
 
+/**
+ * Bare ids, for assertions that predate the (type, id) key and do not depend on
+ * it. A convenience for tests whose fixtures use one type per id -- the store
+ * itself deliberately offers no such view, because an id alone does not name a
+ * document any more.
+ */
+const idsOf = (s: DocumentStore) => new Set(s.refs().map((r) => r.id))
+
 const dirs: string[] = []
 const fresh = () => {
   const d = tmpdir('sync')
@@ -166,7 +174,7 @@ describe('sync', () => {
     assert.equal(r.changed, 0)
     assert.equal(r.deleted, 1)
     assert.equal(h.store.count(), before - 1)
-    assert.equal(h.store.ids().has('post-5'), false)
+    assert.equal(idsOf(h.store).has('post-5'), false)
     await h.close()
   })
 
@@ -225,7 +233,7 @@ describe('sync', () => {
 
     const r = await sync(h.adapter, h.store, { pageSize: 500 })
     assert.equal(r.changed, 1)
-    assert.equal(h.store.ids().has('post-tie'), true)
+    assert.equal(idsOf(h.store).has('post-tie'), true)
     await h.close()
   })
 
@@ -283,7 +291,14 @@ describe('content type transitions', () => {
 
       const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES, full: true })
       assert.equal(r.changed, 1, 'a type change must be reported as a change')
-      assert.equal(r.deleted, 0, 'the document still exists and is still rendered')
+      // One, not zero, and the change is deliberate. Under a (type, id) key the
+      // row at (post, id) genuinely ceased to exist -- the CMS no longer lists
+      // anything there -- so the reconcile removes it and `deleted` counts a row
+      // that really did leave the mirror. The document is not lost: it is now
+      // the row at (page, id), asserted below. Reported honestly rather than
+      // suppressed, because the service reads `deleted` to decide it must
+      // publish, and route membership did change.
+      assert.equal(r.deleted, 1, 'the row at the old type is gone; the document is not')
 
       const stored = h.store.byType(['page', 'post'])
       assert.ok(
@@ -320,7 +335,7 @@ describe('content type transitions', () => {
       await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
       const post = docs.find((d) => d.type === 'post')!
       const id = String(post.doc.id)
-      assert.ok(h.store.ids().has(id))
+      assert.ok(idsOf(h.store).has(id))
 
       // Still in the CMS, no longer a type this site renders -- an editor moving
       // a post into an internal collection, or a config that stopped listing it.
@@ -328,17 +343,18 @@ describe('content type transitions', () => {
 
       const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES, full: true })
       assert.equal(r.deleted, 1, 'the out-of-scope document must leave the mirror')
-      assert.equal(h.store.ids().has(id), false)
+      assert.equal(idsOf(h.store).has(id), false)
     } finally {
       await h.close()
     }
   })
 
-  test('and on a delta pull, where the id listing cannot see types at all', async () => {
-    // The half a reconcile scan structurally cannot reach: listIds() returns
-    // ids and revisions, so a document that merely changed type is present and
-    // accounted for on every scan. Without the targeted removal this row
-    // survives indefinitely.
+  test('and on a delta pull, where the change is invisible to the delta filter', async () => {
+    // listIds() carries the type now, so a reconcile can see this transition
+    // where it once could not -- the row at the old type is absent from a
+    // listing that enumerates every collection. Kept because the delta path
+    // reaches it by a different route than the full path, and because the delta
+    // *filter* still cannot see a type change on its own.
     const docs = blogDocs({ posts: 3 })
     const h = await harness(docs)
     try {
@@ -352,7 +368,34 @@ describe('content type transitions', () => {
       const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
       assert.equal(r.strategy, 'delta', 'this test is only meaningful on the delta path')
       assert.equal(r.deleted, 1)
-      assert.equal(h.store.ids().has(id), false)
+      assert.equal(idsOf(h.store).has(id), false)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('a type dropping out of the site config removes its stored rows', async () => {
+    // What the targeted removal is *for*, now that (type, id) is the key.
+    //
+    // It used to be the only path that could remove a document which moved from
+    // a rendered type to an unrendered one, because a mirror keyed by id alone
+    // could not see a type change. The composite key turned that into an
+    // ordinary disappearance, which the reconcile handles. What is left is the
+    // case a reconcile still cannot reach: the document is present in the CMS
+    // and therefore in `seen`, so deleteMissing will spare it -- but the site
+    // stopped listing its type. Config change, not content change, and the CMS
+    // positively stated the type, so it keeps the ratio-free removal.
+    const docs = blogDocs({ posts: 3 })
+    const h = await harness(docs)
+    try {
+      await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'] })
+      const pages = h.store.refs().filter((r) => r.type === 'page')
+      assert.ok(pages.length > 0, 'the fixture must contain pages for this to mean anything')
+
+      // The same corpus, with 'page' no longer rendered by this site.
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post'], full: true })
+      assert.equal(r.deleted, pages.length, 'every row at the dropped type must go')
+      assert.equal(h.store.refs().some((x) => x.type === 'page'), false)
     } finally {
       await h.close()
     }
@@ -368,7 +411,7 @@ describe('content type transitions', () => {
     try {
       const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
       assert.equal(r.deleted, 0)
-      assert.equal(h.store.ids().has('note-1'), false)
+      assert.equal(idsOf(h.store).has('note-1'), false)
     } finally {
       await h.close()
     }
@@ -378,7 +421,7 @@ describe('content type transitions', () => {
     const h = await harness(blogDocs({ posts: 4 }))
     try {
       await sync(h.adapter, h.store, { pageSize: 500, contentTypes: TYPES })
-      const all = [...h.store.ids()]
+      const all = h.store.refs()
       const doomed = all.slice(0, 2)
       // No ratio ceiling, deliberately: this is positive per-document evidence
       // from the CMS, not an inference from a listing that might be short. Half
@@ -386,7 +429,7 @@ describe('content type transitions', () => {
       assert.equal(h.store.deleteIds(doomed), 2)
       assert.equal(h.store.count(), all.length - 2)
       // An id that is not stored is not an error and is not counted.
-      assert.equal(h.store.deleteIds(['no-such-id']), 0)
+      assert.equal(h.store.deleteIds([{ type: 'post', id: 'no-such-id' }]), 0)
       assert.equal(h.store.deleteIds([]), 0)
     } finally {
       await h.close()
@@ -544,7 +587,7 @@ describe('sync — a listing that came back short', () => {
       return { items: docs.slice(0, deliver), cursor: null, total }
     },
     async listIds() {
-      return docs.map((d) => ({ id: d.id, revision: d.revision }))
+      return docs.map((d) => ({ type: d.type, id: d.id, revision: d.revision }))
     },
     revisionOf: () => null,
     bytesRead: () => 0,
@@ -642,4 +685,107 @@ describe('sync — a listing that came back short', () => {
     }
   })
 
+})
+
+// Two collections, one id. The mirror was keyed by id alone until this, and a
+// multi-collection CMS puts no constraint across collections.
+describe('sync — documents are identified by (type, id)', () => {
+  const shared = (): MockDoc[] => [
+    { type: 'post', doc: { id: 'shared', title: 'THE POST', updated_at: 1000, rev: 'rp' } },
+    { type: 'page', doc: { id: 'shared', title: 'THE PAGE', updated_at: 1000, rev: 'rg' } },
+    { type: 'post', doc: { id: 'post-only', title: 'a post', updated_at: 1000, rev: 'r1' } },
+  ]
+
+  test('an id shared across two types keeps both documents', async () => {
+    const h = await harness(shared())
+    try {
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'] })
+      assert.equal(r.pulled, 3)
+      // Three sent, three stored. Under the old key this was three sent and two
+      // stored, with the post's "shared" silently replaced by the page's.
+      assert.equal(h.store.count(), 3)
+      const stored = h.store.byType(['post', 'page'])
+      assert.equal((stored.get('post') ?? []).find((d) => d.id === 'shared')?.title, 'THE POST')
+      assert.equal((stored.get('page') ?? []).find((d) => d.id === 'shared')?.title, 'THE PAGE')
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('and the mirror converges, which is the half that made it expensive', async () => {
+    // The finding that decided this item. A collision is not a one-time
+    // overwrite: the two documents overwrite each other on every sync, because
+    // `known` is a snapshot taken before the pull and the loser always differs
+    // from it. `changed` therefore never reaches zero, and the service publishes
+    // whenever it is non-zero -- so one shared id rebuilt and redeployed the
+    // entire site on every poll, forever, with nothing reported anywhere.
+    const h = await harness(shared())
+    try {
+      const first = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'] })
+      assert.equal(first.changed, 3)
+      const again = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'], full: true })
+      assert.equal(again.changed, 0, 'a settled corpus must report no change')
+      assert.equal(again.deleted, 0)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('a delete reconcile does not confuse one for the other', async () => {
+    // listIds() carries the type for this reason: a reconcile built from ids
+    // alone would compare a set of ids against a set of (type, id) keys, find
+    // every key missing, and propose deleting the whole mirror.
+    const docs = shared()
+    const h = await harness(docs)
+    try {
+      await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'] })
+      docs.splice(1, 1) // the page's "shared" is deleted in the CMS
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'], full: true })
+      assert.equal(r.deleted, 1, 'exactly the page, not the post that shares its id')
+      const stored = h.store.byType(['post', 'page'])
+      assert.equal((stored.get('post') ?? []).find((d) => d.id === 'shared')?.title, 'THE POST')
+      assert.equal((stored.get('page') ?? []).length, 0)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('two documents at the SAME type and id are refused, terminally', async () => {
+    // What the composite key does not fix and was never meant to: an id shared
+    // *inside* one type, which happens when two collections are mapped onto one
+    // type. There is no correct resolution, so it is a refusal rather than a
+    // silent winner.
+    const h = await harness([
+      { type: 'post', doc: { id: 'dup', title: 'first', updated_at: 1000, rev: 'r1' } },
+      { type: 'post', doc: { id: 'dup', title: 'second', updated_at: 1000, rev: 'r2' } },
+    ])
+    try {
+      await assert.rejects(
+        () => sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post'] }),
+        (e: Error) => {
+          assert.equal((e as { rail?: string }).rail, 'cms.duplicate-document')
+          assert.equal((e as { terminal?: boolean }).terminal, true)
+          assert.match(e.message, /both "dup" at type "post"/)
+          return true
+        })
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('the same corpus without duplicates is not refused', async () => {
+    // The negative control for the refusal above: it has to fire on a repeated
+    // (type, id) and not merely on a repeated id.
+    const h = await harness([
+      { type: 'post', doc: { id: 'dup', title: 'first', updated_at: 1000, rev: 'r1' } },
+      { type: 'page', doc: { id: 'dup', title: 'second', updated_at: 1000, rev: 'r2' } },
+    ])
+    try {
+      const r = await sync(h.adapter, h.store, { pageSize: 500, contentTypes: ['post', 'page'] })
+      assert.equal(r.pulled, 2)
+      assert.equal(h.store.count(), 2)
+    } finally {
+      await h.close()
+    }
+  })
 })

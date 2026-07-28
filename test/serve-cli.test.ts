@@ -139,7 +139,7 @@ describe('serve command', () => {
       post.doc.updated_at = Number(post.doc.updated_at) + 5000
       post.doc.rev = 'cli-rev-2'
 
-      const hook = await s.signed('/webhook', JSON.stringify({ id: post.doc.id, rev: 'cli-rev-2' }))
+      const hook = await s.signed('/webhook', JSON.stringify({ type: post.type, id: post.doc.id, rev: 'cli-rev-2' }))
       assert.equal(hook.status, 202)
       assert.deepEqual(await hook.json(), { queued: true, expectations: 1 })
 

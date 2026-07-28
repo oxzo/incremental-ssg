@@ -180,13 +180,13 @@ describe('webhook endpoint', () => {
   test('the revision in the payload becomes a read-after-write expectation', async () => {
     const e = await endpoint({ secret: 's' })
     try {
-      const res = await e.post('/webhook', JSON.stringify({ id: 'post-3', rev: 'rev-42' }), {
+      const res = await e.post('/webhook', JSON.stringify({ type: 'post', id: 'post-3', rev: 'rev-42' }), {
         'x-webhook-token': 's',
       })
       assert.equal(res.status, 202)
       assert.deepEqual(await res.json(), { queued: true, expectations: 1 })
       await e.service.idle()
-      assert.deepEqual(e.seen[0].expectations, [{ id: 'post-3', revision: 'rev-42' }])
+      assert.deepEqual(e.seen[0].expectations, [{ type: 'post', id: 'post-3', revision: 'rev-42' }])
       assert.equal(e.seen[0].force, false)
     } finally {
       await e.close()

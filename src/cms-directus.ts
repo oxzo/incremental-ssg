@@ -385,8 +385,8 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
      * would refuse a listing that was complete.
      */
     async listIds() {
-      const out: { id: string; revision: string }[] = []
-      for (const { collection } of cols) {
+      const out: { type: string; id: string; revision: string }[] = []
+      for (const { collection, type } of cols) {
         const qs = new URLSearchParams({
           limit: '-1',
           fields: 'doc_id,date_updated,date_created',
@@ -411,7 +411,11 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
         for (const row of rows) {
           const id = row.doc_id
           if (typeof id !== 'string' || id === '') continue
-          out.push({ id, revision: (row.date_updated as string) ?? (row.date_created as string) ?? '' })
+          out.push({
+            type: type ?? collection,
+            id,
+            revision: (row.date_updated as string) ?? (row.date_created as string) ?? '',
+          })
         }
       }
       return out
@@ -442,7 +446,16 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
       const id = first.doc_id
       const revision = first.date_updated ?? first.date_created
       if (typeof id !== 'string' || id === '' || revision === undefined || revision === null) return null
-      return { id, revision: String(revision) }
+      // The collection has been in this payload all along -- stack/seed.ts sends
+      // {"event":…,"collection":"{{$trigger.collection}}","docs":…} -- and was
+      // discarded here while the mirror was keyed by id alone. It is what names
+      // the document now, so a payload without it buys no expectation: the
+      // read-after-write check would look up a document that cannot be found, or
+      // find a different one sharing the id.
+      const collection = typeof p.collection === 'string' ? p.collection : null
+      if (collection === null) return null
+      const mapped = cols.find((c) => c.collection === collection)
+      return { type: mapped?.type ?? collection, id, revision: String(revision) }
     },
 
     bytesRead: () => bytes,

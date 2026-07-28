@@ -10,8 +10,15 @@ import { DatabaseSync } from 'node:sqlite'
 import { RailError, checkNumber } from './rails.ts'
 import type { Doc, DocsByType } from './config.ts'
 
-/** Bumped when a change here makes an existing database file unreadable. */
-export const STORE_SCHEMA = 1
+/**
+ * Bumped when a change here makes an existing database file unreadable.
+ *
+ * 2: the primary key became (type, id). A v1 mirror is not migrated in place --
+ * it is refused with instructions to delete and re-sync, which costs one full
+ * pull and is the remedy this file is designed around. See the header: the
+ * mirror holds nothing that can be stale, so it is always reproducible.
+ */
+export const STORE_SCHEMA = 2
 
 export type StoredDoc = {
   id: string
@@ -39,6 +46,29 @@ export type StoredDoc = {
  * search with silence is worse than one that is hard to read.
  */
 export const documentIdentity = (type: string, hash: string) => `${type}\x00${hash}`
+
+/**
+ * What makes a document *that* document: its type and its id, together.
+ *
+ * `id` alone was the primary key until this, and a multi-collection CMS makes
+ * that a collision rather than a key. Directus puts no constraint across
+ * collections, so two of them carrying a slug-shaped `doc_id` -- an ordinary
+ * schema -- had one document overwrite the other on arrival. The measured
+ * result was not a one-time loss but a mirror that never converges: the two
+ * overwrite each other on every sync, `changed` never reaches zero, and the
+ * service rebuilds and redeploys the whole site on every poll forever.
+ *
+ * Same NUL separator and the same reason as documentIdentity above: a type name
+ * cannot contain it, so two different pairs cannot fold into one string.
+ *
+ * One definition, exported, because the store builds these from rows and sync
+ * builds them from CMS responses -- two spellings of "the same document" would
+ * agree until one of them was fixed.
+ */
+export const documentKey = (type: string, id: string) => `${type}\x00${id}`
+
+/** A document's identity as a pair, for the calls that have to name one. */
+export type DocRef = { type: string; id: string }
 
 export type UpsertInput = {
   id: string
@@ -68,13 +98,23 @@ export class DocumentStore {
   private migrate() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS documents (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         type TEXT NOT NULL,
         revision TEXT NOT NULL,
         updated_at INTEGER NOT NULL,
         hash TEXT NOT NULL,
-        json TEXT NOT NULL
+        json TEXT NOT NULL,
+        -- (type, id) rather than id. A multi-collection CMS puts no constraint
+        -- across collections, so id alone is not a key: two collections
+        -- carrying a slug-shaped doc_id had one document overwrite the other on
+        -- arrival, and kept doing it on every sync. Ordered (type, id) rather
+        -- than (id, type) so it also serves byType()'s read -- see below.
+        PRIMARY KEY (type, id)
       );
+      -- Formerly a separate index, now the primary key's own B-tree, which is
+      -- why there is nothing to create here any more. The reasoning is kept
+      -- because it is what makes the *order* of the key columns load-bearing
+      -- rather than arbitrary:
       -- (type, id) rather than (type). byType() is the only type-filtered query
       -- in the engine and it reads ORDER BY type, id -- with an index on type
       -- alone SQLite satisfied the filter and then built a temp B-tree for the
@@ -84,10 +124,11 @@ export class DocumentStore {
       -- the same read costs 170ms. It is paid once per worker plus once on the
       -- main thread, so at ten workers this is the difference between ~6.4s and
       -- ~3s of aggregate CPU.
-      CREATE INDEX IF NOT EXISTS idx_documents_type_id ON documents(type, id);
-      -- Strictly redundant now: any query that could use (type) can use the
-      -- leftmost prefix of (type, id). Kept as a DROP rather than left in place
-      -- so sync does not maintain a second index that nothing reads.
+      -- Both dropped rather than left in place, for the same reason the second
+      -- one was dropped when the first arrived: sync should not maintain an
+      -- index nothing reads. idx_documents_type_id is now exactly the primary
+      -- key, so keeping it would double every write to buy nothing.
+      DROP INDEX IF EXISTS idx_documents_type_id;
       DROP INDEX IF EXISTS idx_documents_type;
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `)
@@ -131,8 +172,10 @@ export class DocumentStore {
    * equal a webhook's revision string. That is what `webhookRevisions` declares,
    * and why an unsatisfied check is reported rather than fatal.
    */
-  revisionOf(id: string): string | null {
-    const row = this.db.prepare('SELECT revision FROM documents WHERE id = ?').get(id) as
+  revisionOf(type: string, id: string): string | null {
+    const row = this.db
+      .prepare('SELECT revision FROM documents WHERE type = ? AND id = ?')
+      .get(type, id) as
       | { revision: string }
       | undefined
     return row ? row.revision : null
@@ -151,7 +194,7 @@ export class DocumentStore {
     const rows = this.db.prepare('SELECT id, type, hash FROM documents').all() as
       { id: string; type: string; hash: string }[]
     const out = new Map<string, string>()
-    for (const r of rows) out.set(r.id, documentIdentity(r.type, r.hash))
+    for (const r of rows) out.set(documentKey(r.type, r.id), documentIdentity(r.type, r.hash))
     return out
   }
 
@@ -166,13 +209,13 @@ export class DocumentStore {
    * protect. Routing these through deleteMissing would refuse a correct,
    * evidenced removal for a reason that does not apply to it.
    */
-  deleteIds(ids: string[]): number {
-    if (ids.length === 0) return 0
-    const del = this.db.prepare('DELETE FROM documents WHERE id = ?')
+  deleteIds(refs: DocRef[]): number {
+    if (refs.length === 0) return 0
+    const del = this.db.prepare('DELETE FROM documents WHERE type = ? AND id = ?')
     let n = 0
     this.db.exec('BEGIN')
     try {
-      for (const id of ids) n += del.run(id).changes > 0 ? 1 : 0
+      for (const r of refs) n += del.run(r.type, r.id).changes > 0 ? 1 : 0
       this.db.exec('COMMIT')
     } catch (e) {
       this.db.exec('ROLLBACK')
@@ -181,9 +224,14 @@ export class DocumentStore {
     return n
   }
 
-  ids(): Set<string> {
-    const rows = this.db.prepare('SELECT id FROM documents').all() as { id: string }[]
-    return new Set(rows.map((r) => r.id))
+  /** Every stored document as (type, id), which is what identifies one. */
+  refs(): DocRef[] {
+    return this.db.prepare('SELECT type, id FROM documents').all() as DocRef[]
+  }
+
+  /** The same set, spelled as composite keys for membership tests. */
+  keys(): Set<string> {
+    return new Set(this.refs().map((r) => documentKey(r.type, r.id)))
   }
 
   count(): number {
@@ -196,8 +244,8 @@ export class DocumentStore {
     if (docs.length === 0) return 0
     const up = this.db.prepare(
       `INSERT INTO documents (id,type,revision,updated_at,hash,json) VALUES (?,?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET
-         type=excluded.type, revision=excluded.revision,
+       ON CONFLICT(type,id) DO UPDATE SET
+         revision=excluded.revision,
          updated_at=excluded.updated_at, hash=excluded.hash, json=excluded.json`)
     this.db.exec('BEGIN')
     try {
@@ -227,10 +275,10 @@ export class DocumentStore {
     const maxDeleteRatio = checkNumber(opts.maxDeleteRatio, 0.5, {
       name: 'maxDeleteRatio', min: 0, max: 1,
     })
-    const local = this.ids()
-    const doomed = [...local].filter((id) => !live.has(id))
+    const local = this.refs()
+    const doomed = local.filter((r) => !live.has(documentKey(r.type, r.id)))
     if (doomed.length === 0) return 0
-    if (local.size > 0 && doomed.length / local.size > maxDeleteRatio && !force) {
+    if (local.length > 0 && doomed.length / local.length > maxDeleteRatio && !force) {
       // Transient, which looks wrong for a mass-delete refusal and is not. The
       // refusal itself deletes nothing, so retrying is safe by construction --
       // and the likeliest cause, a listing that came back short, is exactly the
@@ -240,15 +288,15 @@ export class DocumentStore {
       throw new RailError(
         'store-delete-ratio',
         false,
-        `deleteMissing() would drop ${doomed.length} of ${local.size} documents ` +
-        `(${((doomed.length / local.size) * 100).toFixed(0)}%), over the ` +
+        `deleteMissing() would drop ${doomed.length} of ${local.length} documents ` +
+        `(${((doomed.length / local.length) * 100).toFixed(0)}%), over the ` +
         `${maxDeleteRatio * 100}% limit. This usually means the reconcile scan ` +
         `returned a partial listing. Pass {force:true} if the sweep is intended.`)
     }
-    const del = this.db.prepare('DELETE FROM documents WHERE id = ?')
+    const del = this.db.prepare('DELETE FROM documents WHERE type = ? AND id = ?')
     this.db.exec('BEGIN')
     try {
-      for (const id of doomed) del.run(id)
+      for (const r of doomed) del.run(r.type, r.id)
       this.db.exec('COMMIT')
     } catch (e) {
       this.db.exec('ROLLBACK')

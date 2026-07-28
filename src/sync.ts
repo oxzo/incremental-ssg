@@ -11,8 +11,8 @@
 import { createHash } from 'node:crypto'
 import { checkNumber, RailError } from './rails.ts'
 import type { CmsAdapter, CmsDocument } from './cms.ts'
-import { documentIdentity } from './store.ts'
-import type { DocumentStore, UpsertInput } from './store.ts'
+import { documentIdentity, documentKey } from './store.ts'
+import type { DocumentStore, DocRef, UpsertInput } from './store.ts'
 
 export const WATERMARK = 'sync:watermark'
 
@@ -159,7 +159,7 @@ export async function sync(
 
     const batch: UpsertInput[] = []
     // Documents the CMS still has, at a type this site does not render.
-    const unwanted: string[] = []
+    const unwanted: DocRef[] = []
     for (const item of page.items as CmsDocument[]) {
       pulled++
       // Added before the type filter, and it belongs there. `seen` answers "did
@@ -167,16 +167,58 @@ export async function sync(
       // now -- and it feeds deleteMissing, whose ratio rail is about listings
       // that came back short. Dropping an out-of-scope document from `seen`
       // would delete its row for the wrong reason and charge it to that rail.
-      seen.add(item.id)
+      // Two documents claiming one identity, which (type, id) does not fix and
+      // was never meant to. The key removes collisions *between* types; this is
+      // one *inside* a type, which only happens when two collections are mapped
+      // onto the same type -- an operator's deliberate merge -- and their ids
+      // overlap. There is no correct resolution: whichever arrives second wins,
+      // the loser is lost, and the two overwrite each other on every sync
+      // forever because the comparison is against a snapshot taken before the
+      // pull. That last part is what makes it worth a refusal rather than a
+      // warning: the service publishes whenever `changed` is non-zero, so a
+      // single collision rebuilds and redeploys the whole site on every poll.
+      //
+      // In sync rather than in an adapter, so it covers every adapter and not
+      // only the one that provoked it -- the same reason the symlink rule went
+      // into walk(). `seen` is already built here, so the check is a membership
+      // test on a structure that exists either way.
+      const key = documentKey(item.type, item.id)
+      if (seen.has(key)) {
+        // Terminal: a shared id inside one type is a fact about the CMS's
+        // contents and its collection-to-type mapping. Nothing about a retry
+        // changes it, and the remedy is not in this repository.
+        throw new RailError(
+          'cms.duplicate-document',
+          true,
+          `two documents in this sync are both "${item.id}" at type "${item.type}". ` +
+          `The mirror is keyed by (type, id), so one would silently overwrite the ` +
+          `other and the pair would keep overwriting each other on every sync. ` +
+          `This happens when two collections are mapped onto one content type and ` +
+          `their document ids overlap: give them distinct ids, or map them to ` +
+          `different types.`)
+      }
+      seen.add(key)
       if (item.updatedAt > maxUpdatedAt) maxUpdatedAt = item.updatedAt
       if (wantTypes && !wantTypes.has(item.type)) {
-        // A document that moved out of scope -- an included type to an excluded
-        // one. Without this its stored row survives every reconcile (it is in
-        // `seen` on a full pull, and listIds carries no type on a delta one), so
-        // the page it renders stays published against content nothing will ever
-        // update again. Removed here rather than reconciled away because this is
-        // positive per-document evidence, not an inference from absence.
-        if (known.has(item.id)) unwanted.push(item.id)
+        // A stored row at a type this site no longer renders.
+        //
+        // Narrower than it was, and for a good reason. This used to be the only
+        // path that could remove a document which *moved* from an included type
+        // to an excluded one, because the mirror was keyed by id and a reconcile
+        // could not see the type change. Under a (type, id) key that move is an
+        // ordinary disappearance -- the row at the old type is simply absent
+        // from the CMS's enumeration -- so the reconcile handles it, and handles
+        // it correctly: with the type in the key we no longer have per-document
+        // evidence that the old row is gone, only the listing's word that it is
+        // not there, which is exactly the doubt the ratio rail exists for.
+        //
+        // What is left here is the case a reconcile still cannot reach: the
+        // document is present and `seen`, so deleteMissing will spare it, but
+        // its type has dropped out of the site's contentTypes since the last
+        // sync. That is a config change rather than a content change, and the
+        // CMS has positively stated the type, so it keeps the ratio-free
+        // removal that A5 built for it.
+        if (known.has(key)) unwanted.push({ type: item.type, id: item.id })
         continue
       }
       const json = canonicalJson(item.doc)
@@ -184,7 +226,7 @@ export async function sync(
       // Type included, because two rendered types are two sets of routes. A
       // document moving between them with an unchanged body is a real change to
       // what the site contains, and comparing hashes alone reports it as none.
-      if (known.get(item.id) !== documentIdentity(item.type, hash)) changed++
+      if (known.get(key) !== documentIdentity(item.type, hash)) changed++
       batch.push({
         id: item.id,
         type: item.type,
@@ -274,7 +316,7 @@ export async function sync(
       const live = await adapter.listIds()
       requests++
       markMutating()
-      deleted += store.deleteMissing(new Set(live.map((l) => l.id)), {
+      deleted += store.deleteMissing(new Set(live.map((l) => documentKey(l.type, l.id))), {
         maxDeleteRatio: opts.maxDeleteRatio,
       })
     }

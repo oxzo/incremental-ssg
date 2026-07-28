@@ -193,28 +193,48 @@ describe('directus adapter — revisionOf', () => {
 
   test('reads a single-key update, where docs is an object', () => {
     assert.deepEqual(
-      adapter.revisionOf({ event: 'post.items.update', docs: { doc_id: 'p3', date_updated: '2026-07-28T07:00:00Z' } }),
-      { id: 'p3', revision: '2026-07-28T07:00:00Z' },
+      adapter.revisionOf({
+        event: 'post.items.update',
+        collection: 'post',
+        docs: { doc_id: 'p3', date_updated: '2026-07-28T07:00:00Z' },
+      }),
+      { type: 'post', id: 'p3', revision: '2026-07-28T07:00:00Z' },
     )
   })
 
   test('reads a multi-key update, where the same field is an array', () => {
     assert.deepEqual(
       adapter.revisionOf({
+        collection: 'post',
         docs: [
           { doc_id: 'p1', date_updated: '2026-07-28T07:00:00Z' },
           { doc_id: 'p2', date_updated: '2026-07-28T07:00:00Z' },
         ],
       }),
-      { id: 'p1', revision: '2026-07-28T07:00:00Z' },
+      { type: 'post', id: 'p1', revision: '2026-07-28T07:00:00Z' },
     )
   })
 
   test('reads a create, which carries date_created and no date_updated', () => {
     assert.deepEqual(
-      adapter.revisionOf({ docs: { doc_id: 'p9', date_created: '2026-07-28T07:00:00Z', date_updated: null } }),
-      { id: 'p9', revision: '2026-07-28T07:00:00Z' },
+      adapter.revisionOf({
+        collection: 'post',
+        docs: { doc_id: 'p9', date_created: '2026-07-28T07:00:00Z', date_updated: null },
+      }),
+      { type: 'post', id: 'p9', revision: '2026-07-28T07:00:00Z' },
     )
+  })
+
+  test('returns null when the payload names no collection', () => {
+    // The mirror is keyed by (type, id), so an expectation without a type cannot
+    // be looked up -- and guessing one would either miss every time or match a
+    // different document sharing the id. stack/seed.ts sends the collection on
+    // every flow ({{$trigger.collection}}), so its absence means a payload this
+    // adapter did not shape, and null is already the safe answer: the service
+    // reads it as "no expectation" and still publishes.
+    assert.equal(
+      adapter.revisionOf({ docs: { doc_id: 'p3', date_updated: '2026-07-28T07:00:00Z' } }),
+      null)
   })
 
   test('returns null for a delete, which can carry no revision at all', () => {

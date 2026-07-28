@@ -67,10 +67,21 @@ export type CmsAdapter = {
   name: string
   capabilities: CmsCapabilities
   list(opts: ListOptions): Promise<CmsPage>
-  /** Complete id listing. The only thing that catches deletes and unpublishes. */
-  listIds(): Promise<{ id: string; revision: string }[]>
-  /** Phase 5: pull the changed document out of a webhook body. */
-  revisionOf(payload: unknown): { id: string; revision: string } | null
+  /**
+   * Complete id listing. The only thing that catches deletes and unpublishes.
+   *
+   * Carries `type` because the mirror is keyed by (type, id): an id alone cannot
+   * name a document, so a reconcile built from ids alone would compare two
+   * different populations and delete whatever the difference happened to be.
+   */
+  listIds(): Promise<{ type: string; id: string; revision: string }[]>
+  /**
+   * Phase 5: pull the changed document out of a webhook body.
+   *
+   * Carries `type` for the same reason -- the read-after-write check looks the
+   * document up in the mirror, and (type, id) is what identifies one there.
+   */
+  revisionOf(payload: unknown): { type: string; id: string; revision: string } | null
   /** Bytes read over the wire, for reporting. */
   bytesRead(): number
 }
@@ -130,7 +141,10 @@ export function httpCmsAdapter(opts: HttpCmsOptions): CmsAdapter {
     },
     async listIds() {
       const body = await getJson(`${base}/ids`)
-      return (body.ids as [string, string][]).map(([id, revision]) => ({
+      // [id, revision, type] rather than [id, revision]: the mirror is keyed by
+      // (type, id), so an entry without a type cannot be compared against it.
+      return (body.ids as [string, string, string][]).map(([id, revision, type]) => ({
+        type: String(type ?? ''),
         id,
         revision: String(revision ?? ''),
       }))
@@ -140,8 +154,12 @@ export function httpCmsAdapter(opts: HttpCmsOptions): CmsAdapter {
       if (!p || typeof p !== 'object') return null
       const id = p.id ?? p.documentId ?? p?.doc?.id
       const revision = p.rev ?? p.revision ?? p?.doc?.rev
-      if (id === undefined || revision === undefined) return null
-      return { id: String(id), revision: String(revision) }
+      const type = p.type ?? p.collection ?? p?.doc?.type
+      // No type, no expectation. The check this feeds looks a document up by
+      // (type, id), and guessing the type would either miss every time or, worse,
+      // match a different document that happens to share the id.
+      if (id === undefined || revision === undefined || type === undefined) return null
+      return { type: String(type), id: String(id), revision: String(revision) }
     },
     bytesRead: () => bytes,
   }

@@ -239,7 +239,7 @@ export async function startWebhookServer(opts: WebhookOptions): Promise<WebhookS
       log({
         event: 'webhook.accepted',
         route,
-        expectations: expectations.map((e) => e.id),
+        expectations: expectations.map((e) => `${e.type}/${e.id}`),
         ...(payloadNote ? { note: payloadNote } : {}),
       })
       return send(res, 202, { queued: true, expectations: expectations.length })
