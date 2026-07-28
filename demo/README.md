@@ -71,16 +71,26 @@ run.published      source=webhook  uploaded=8  unchanged=2314
 
 ## Choosing which post to edit
 
-**Edit an old post for a clean demo — expect single digits.** Editing one of the
-*newest* posts in a tag publishes hundreds of files, and that is correct rather
-than broken: this site puts a related-posts sidebar on every post, drawn from the
-newest entries of each tag, so those few posts genuinely appear on a third of the
-site. The distribution is measured in `bench/run-fanout-templates.ts` — median 8
-routes, maximum 835 at 2,000 posts.
+**The fixture dates posts newest-first, so "old" means a HIGH index.** `post-0` is
+the newest post in the corpus and `post-1999` is the oldest. This is the opposite
+of what the numbering suggests, and guessing wrong is how you end up demonstrating
+the expensive case by accident.
 
-Both are worth showing. The small number is the deploy diff earning its keep; the
-large one is why fan-out is a property of the template set rather than of the
-content model.
+| To show | Edit | Expect |
+|---|---|---|
+| the deploy diff earning its keep | the highest-numbered post | single digits |
+| why fan-out is a template property | `post-0`–`post-7` | hundreds |
+
+Measured on the live demo: editing the oldest post's title published **5 files of
+2,323 in 3.1 s**. Editing `post-7` — which reads as early but is among the newest
+in its tags — published **408**.
+
+The large number is correct rather than broken: this site puts a related-posts
+sidebar on every post, drawn from the newest entries of each tag, so those few
+posts genuinely appear on a third of the site. The distribution is measured in
+`bench/run-fanout-templates.ts` — median 8 routes, maximum 835 at 2,000 posts.
+
+Both are worth showing.
 
 ## Caching, and why there is deliberately none
 
@@ -94,6 +104,14 @@ there is nothing to invalidate, which is why `s3DeployTarget` still reports
 `pathPurge: false` honestly. Putting a real edge cache in front of this is what
 would make implementing `purge()` meaningful — and it is the next thing that
 would make the demo more, not less, honest.
+
+**Observed, unexplained:** the Worker sets an `ETag` from the stored object on
+every response, and against the deployed URL it survives on asset responses but is
+absent on HTML ones. Something at the edge is dropping it and the cause has not
+been chased. The consequence is small but real — HTML is served
+`must-revalidate`, so with no validator a revalidation cannot return 304 and
+transfers the whole body instead. Recorded rather than fixed, because a guess
+about the cause would be worth less than the observation.
 
 ## Costs
 
