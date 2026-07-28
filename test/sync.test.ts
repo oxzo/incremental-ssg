@@ -1,13 +1,19 @@
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
 import { startMockCms } from '../src/cms-mock.ts'
 import { httpCmsAdapter } from '../src/cms.ts'
 import { DocumentStore } from '../src/store.ts'
-import { sync, canonicalJson } from '../src/sync.ts'
+import { sync, canonicalJson, SYNC_MUTATING } from '../src/sync.ts'
 import { tmpdir, cleanup, blogDocs, EPOCH } from './fixture.ts'
 import type { MockDoc } from '../src/cms-mock.ts'
 import type { CmsCapabilities } from '../src/cms.ts'
+import type { AddressInfo } from 'node:net'
+import type { ChildProcess } from 'node:child_process'
+
+const CRASHER = resolve(import.meta.dirname, 'sync-crasher.ts')
 
 const dirs: string[] = []
 const fresh = () => {
@@ -218,5 +224,119 @@ describe('sync', () => {
     assert.equal((stored.get('post') ?? []).length, 5)
     assert.equal((stored.get('author') ?? []).length, 0)
     await h.close()
+  })
+})
+
+/**
+ * The window between sync's first commit and its watermark write.
+ *
+ * Documents land page by page and the watermark is written once at the end, so a
+ * crash in between leaves a store that is ahead of the cursor describing it. The
+ * loss is silent: the restart re-pulls from the old watermark, finds those
+ * documents already stored, reports `changed: 0`, and advances the watermark
+ * over them. Every individual step is correct and the publish is gone.
+ */
+describe('sync interrupted mid-write', () => {
+  /**
+   * Serves one page, then hangs -- and reports the hang so the caller can kill
+   * the client while it waits.
+   *
+   * The second request is the kill point because sync commits each page before
+   * asking for the next, so its arrival *proves* page one is durable. That makes
+   * the test deterministic where a timer would be a guess: no sleep long enough
+   * to be reliable, no sleep short enough to be fast.
+   */
+  function oneThenHang(docs: MockDoc[], onHang: () => void) {
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const cursor = url.searchParams.get('cursor')
+      if (cursor !== null) {
+        onHang()
+        return // deliberately never answered
+      }
+      const limit = Number(url.searchParams.get('limit') ?? 100)
+      const slice = docs.slice(0, limit)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        items: slice,
+        next: limit < docs.length ? String(limit) : null,
+        total: docs.length,
+      }))
+    })
+    return new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+      server.listen(0, '127.0.0.1', () => {
+        const { port } = server.address() as AddressInfo
+        resolve({
+          url: `http://127.0.0.1:${port}`,
+          close: () => new Promise<void>((r) => server.close(() => r())),
+        })
+      })
+    })
+  }
+
+  test('a sync killed after its first page leaves the marker set and the watermark behind', async () => {
+    const docs = blogDocs({ posts: 8 })
+    const dbPath = fresh()
+    let child: ChildProcess | null = null
+    let killed = false
+    const cms = await oneThenHang(docs, () => {
+      killed = true
+      // SIGKILL, not SIGTERM: the point is a writer that stops existing, with no
+      // opportunity to close the database or run a handler.
+      child?.kill('SIGKILL')
+    })
+
+    try {
+      const exit = await new Promise<number | null>((resolve, reject) => {
+        child = spawn(
+          process.execPath,
+          ['--no-warnings', CRASHER, cms.url, dbPath, '4'],
+          { stdio: ['ignore', 'pipe', 'inherit'] })
+        let out = ''
+        child.stdout!.on('data', (b) => { out += String(b) })
+        child.on('error', reject)
+        child.on('exit', (code, signal) => {
+          assert.ok(!out.includes('completed'), 'the sync finished; the kill point never fired')
+          resolve(signal === null ? code : null)
+        })
+      })
+      assert.equal(killed, true, 'the CMS never saw a second request')
+      assert.equal(exit, null, 'the child should have died by signal, not exited')
+
+      const store = new DocumentStore(dbPath)
+      try {
+        // Page one is durable -- this is the content that has nothing pointing
+        // at it, and the whole reason the marker has to exist.
+        assert.equal(store.count(), 4)
+        assert.equal(store.getMeta('sync:watermark'), null, 'the watermark must not have advanced')
+        assert.equal(
+          store.getMeta(SYNC_MUTATING), '1',
+          'an interrupted sync must leave the marker that says so')
+      } finally {
+        store.close()
+      }
+    } finally {
+      child?.kill('SIGKILL')
+      await cms.close()
+    }
+  })
+
+  test('a completed sync clears the marker, so an idle poll is not wedged into rebuilding', async () => {
+    const h = await harness(blogDocs({ posts: 3 }))
+    try {
+      // Set by hand, as a previous crashed sync would have left it. A completed
+      // sync must clear it even though this run never mutated anything --
+      // otherwise recovering from one crash costs a rebuild on every poll from
+      // then on, which trades a lost publish for a permanently busy service.
+      h.store.setMeta(SYNC_MUTATING, '1')
+      await sync(h.adapter, h.store, { pageSize: 500 })
+      assert.equal(h.store.getMeta(SYNC_MUTATING), '0')
+
+      const idle = await sync(h.adapter, h.store, { pageSize: 500 })
+      assert.equal(idle.changed, 0)
+      assert.equal(h.store.getMeta(SYNC_MUTATING), '0')
+    } finally {
+      await h.close()
+    }
   })
 })

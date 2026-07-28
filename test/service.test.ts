@@ -4,6 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { join, resolve } from 'node:path'
 import { createService, createPipeline, silentLog, DIRTY_KEY } from '../src/service.ts'
 import { DocumentStore } from '../src/store.ts'
+import { SYNC_MUTATING } from '../src/sync.ts'
 import { RailError } from '../src/rails.ts'
 import { acquireLock } from '../src/build-lock.ts'
 import { startMockCms } from '../src/cms-mock.ts'
@@ -30,6 +31,7 @@ function ok(t: Trigger): RunReport {
     source: t.source,
     skipped: null,
     dirtyOnEntry: false,
+    syncInterrupted: false,
     sync: { strategy: 'delta', pulled: 1, changed: 1, deleted: 0, requests: 1, syncs: 1 },
     readAfterWrite: { checked: false, expected: 0, outstanding: [], attempts: 0, reason: null },
     build: { routes: 10, files: 10, bytes: 100 },
@@ -285,6 +287,14 @@ describe('pipeline', () => {
       dbPath,
       workDir: d,
       cms,
+      meta: (key: string) => {
+        const s = new DocumentStore(dbPath)
+        try {
+          return s.getMeta(key)
+        } finally {
+          s.close()
+        }
+      },
       dirty: () => {
         const s = new DocumentStore(dbPath)
         try {
@@ -376,6 +386,53 @@ describe('pipeline', () => {
       assert.equal(r.sync!.changed, 0, 'sync should indeed see nothing new')
       assert.equal(r.skipped, null, 'the outstanding publish must still be built')
       assert.equal(p.dirty(), '0')
+    } finally {
+      await p.close()
+    }
+  })
+
+  test('a publish outstanding from a crashed sync survives into the next run', async () => {
+    const p = await pipelineFor(blogDocs())
+    try {
+      await p.run(trigger())
+      assert.equal(p.dirty(), '0')
+
+      // What a crash *inside* sync leaves behind, and the case the dirty flag
+      // alone cannot cover: documents committed to the mirror that the watermark
+      // does not describe, and no dirty flag, because the stage that writes it
+      // never ran. This run's own sync will report nothing changed -- correctly,
+      // since the content is already stored -- and advance the watermark over
+      // it. Sync's marker is the only thing that remembers a publish is owed.
+      const s = new DocumentStore(p.dbPath)
+      s.setMeta(SYNC_MUTATING, '1')
+      s.close()
+
+      const r = await p.run(trigger({ source: 'startup' }))
+      assert.equal(r.syncInterrupted, true)
+      assert.equal(r.dirtyOnEntry, false, 'the crash landed before any flag was written')
+      assert.equal(r.sync!.changed, 0, 'sync should indeed see nothing new')
+      assert.equal(r.skipped, null, 'the interrupted sync must still be published')
+      assert.equal(p.dirty(), '0')
+      // Cleared by the sync that completed, or recovering from one crash would
+      // cost a rebuild on every poll from then on.
+      assert.equal(p.meta(SYNC_MUTATING), '0')
+    } finally {
+      await p.close()
+    }
+  })
+
+  test('without the marker the same run skips, which is the defect it was added for', async () => {
+    // The negative control for the test above. Identical state and trigger with
+    // the marker absent -- exactly the behaviour before it existed. If this
+    // skipped and that one also skipped, the test above would be passing for
+    // reasons unrelated to the thing it claims to check.
+    const p = await pipelineFor(blogDocs())
+    try {
+      await p.run(trigger())
+      const r = await p.run(trigger({ source: 'startup' }))
+      assert.equal(r.syncInterrupted, false)
+      assert.match(r.skipped ?? '', /no changes/)
+      assert.equal(r.build, null)
     } finally {
       await p.close()
     }

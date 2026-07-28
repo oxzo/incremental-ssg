@@ -188,6 +188,40 @@ MUTATIONS: list[Mutation] = [
         "the ListObjectsV2 API caps MaxKeys at 1000 regardless of what is asked",
         "test/deploy-s3.test.ts",
     ),
+    # --- the crash window inside sync ------------------------------------------
+    #
+    # Not covered here, deliberately: the *ordering* of the watermark write and
+    # the marker clear, and of the dirty flag against sync's clear of the marker.
+    # Both are one-statement windows, and this project has already learned once
+    # that a race test sampling tens of draws across a microsecond window
+    # certifies nothing (see the build-lock note). Those two are justified by
+    # construction and their source comments say so rather than implying a
+    # coverage that does not exist. What is mutated below is the part a test can
+    # actually observe: whether the marker is written, cleared, and read at all.
+    Mutation(
+        "sync-mutating-never-set",
+        "src/sync.ts",
+        "    if (batch.length > 0) markMutating()",
+        "    if (false) markMutating()",
+        "a sync that dies mid-write leaves no record, so the restart's own 'nothing changed' is believed and the publish is lost",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-mutating-never-cleared",
+        "src/sync.ts",
+        "  store.setMeta(SYNC_MUTATING, '0')",
+        "  store.setMeta(SYNC_MUTATING, '1')",
+        "a marker a completed sync never clears trades one lost publish for a rebuild on every poll forever",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "service-ignores-sync-marker",
+        "src/service.ts",
+        "        dirty = report.dirtyOnEntry || report.syncInterrupted",
+        "        dirty = report.dirtyOnEntry",
+        "sync records the interrupted write and the pipeline skips anyway, which is the whole defect with an extra step",
+        "test/service.test.ts",
+    ),
     # --- the injection proxy, which is test infrastructure that can also lie ---
     Mutation(
         "proxy-truncation-is-a-noop",

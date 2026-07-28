@@ -25,13 +25,24 @@
 // entries cannot be acted on individually is a set with all the completeness
 // hazards and none of the value.
 //
-// What must survive a crash is exactly one bit: is a publish outstanding? That
-// lives in the store's meta table as `service:dirty`, set *before* the build
-// starts and cleared *only* after the deploy succeeds. The ordering is the whole
-// guarantee. Set-after-build would lose a publish to a crash mid-build;
-// clear-before-deploy would lose one to a crash mid-deploy. Either produces the
-// silent-stale failure -- sync has already advanced its watermark, so the next
-// run finds nothing changed and never rebuilds, and no error is ever raised.
+// What must survive a crash is whether a publish is outstanding. That lives in
+// the store's meta table as `service:dirty`, set *before* the build starts and
+// cleared *only* after the deploy succeeds. The ordering is the whole guarantee.
+// Set-after-build would lose a publish to a crash mid-build; clear-before-deploy
+// would lose one to a crash mid-deploy. Either produces the silent-stale failure
+// -- sync has already advanced its watermark, so the next run finds nothing
+// changed and never rebuilds, and no error is ever raised.
+//
+// That paragraph named the hazard correctly and then placed the flag one stage
+// too late, which an external review caught. "Before the build starts" is not
+// early enough, because sync commits the mirror page by page: the same loss is
+// available in the window between sync's first commit and its watermark write,
+// and this stage cannot cover it -- the run that would set the flag has not
+// reached this code yet. So sync carries its own marker for its own window
+// (`sync:mutating`, and the reasoning lives in src/sync.ts), and the run reads
+// it here as an outstanding publish. Two markers, because durable state moves
+// ahead of the thing describing it in two places, and neither can vouch for the
+// other.
 //
 // The one thing a per-event payload carries that the flag does not is the
 // read-after-write revision, and that expires in seconds; after a restart it is
@@ -40,7 +51,7 @@
 import { setTimeout as sleep } from 'node:timers/promises'
 import { dirname } from 'node:path'
 import { DocumentStore } from './store.ts'
-import { sync } from './sync.ts'
+import { sync, SYNC_MUTATING } from './sync.ts'
 import { build } from './build.ts'
 import { deploy } from './deploy.ts'
 import { loadSite } from './config.ts'
@@ -80,6 +91,8 @@ export type RunReport = {
   /** Non-null when the run stopped before building, with the reason. */
   skipped: string | null
   dirtyOnEntry: boolean
+  /** A previous sync died between its first commit and its watermark write. */
+  syncInterrupted: boolean
   sync: {
     strategy: string
     pulled: number
@@ -173,6 +186,7 @@ export function createPipeline(opts: PipelineOptions): Pipeline {
       source: trigger.source,
       skipped: null,
       dirtyOnEntry: false,
+      syncInterrupted: false,
       sync: null,
       readAfterWrite: { checked: false, expected: 0, outstanding: [], attempts: 0, reason: null },
       build: null,
@@ -192,7 +206,26 @@ export function createPipeline(opts: PipelineOptions): Pipeline {
       const store = new DocumentStore(opts.dbPath)
       try {
         report.dirtyOnEntry = store.getMeta(DIRTY_KEY) === '1'
-        dirty = report.dirtyOnEntry
+        // Read before sync() runs, because a completed sync clears it. A sync
+        // that died mid-write left committed documents its watermark does not
+        // cover, so the sync below will report them as unchanged -- correctly,
+        // and uselessly. This marker is the only thing that remembers.
+        report.syncInterrupted = store.getMeta(SYNC_MUTATING) === '1'
+        dirty = report.dirtyOnEntry || report.syncInterrupted
+
+        // Persisted *before* sync, not after, and the two markers overlap on
+        // purpose. A completed sync clears `sync:mutating` on its way through,
+        // so writing the flag afterwards leaves a window -- narrow, and holding
+        // a WAL checkpoint -- in which the only record of an interrupted sync
+        // has been erased and nothing has replaced it yet. A crash there loses
+        // the publish exactly as before, one stage further along. Handing over
+        // with both set briefly costs one meta write on a run that was going to
+        // build anyway.
+        //
+        // This does not defeat the skip rule below: `dirty` is only true here
+        // when a previous run left something outstanding. An idle poll finds
+        // both markers clear, writes nothing, and still skips.
+        if (dirty) store.setMeta(DIRTY_KEY, '1')
 
         const first = await sync(opts.adapter, store, {
           pageSize: opts.pageSize,
@@ -200,13 +233,15 @@ export function createPipeline(opts: PipelineOptions): Pipeline {
           reconcile: true,
         })
         syncs = 1
-        if (first.changed > 0 || first.deleted > 0) dirty = true
 
-        // Persisted here, before anything expensive runs. A crash between this
-        // line and a successful deploy leaves the flag set, so the next run --
-        // or the next process, after a restart -- rebuilds and publishes even
-        // though its own sync will find nothing changed.
-        if (dirty) store.setMeta(DIRTY_KEY, '1')
+        // And again after sync, for the changes sync itself just found. A crash
+        // between this line and a successful deploy leaves the flag set, so the
+        // next run -- or the next process, after a restart -- rebuilds and
+        // publishes even though its own sync will find nothing changed.
+        if (first.changed > 0 || first.deleted > 0) {
+          dirty = true
+          store.setMeta(DIRTY_KEY, '1')
+        }
 
         report.readAfterWrite = await checkReadAfterWrite(store, trigger, {
           adapter: opts.adapter,
@@ -236,6 +271,15 @@ export function createPipeline(opts: PipelineOptions): Pipeline {
         // and sync's own prepareForReaders has already put it in a journal mode
         // they can share.
         store.close()
+      }
+
+      if (report.syncInterrupted) {
+        log({
+          event: 'sync.interrupted',
+          note:
+            'a previous sync committed documents its watermark never covered, so this ' +
+            'run publishes instead of trusting its own "nothing changed"',
+        })
       }
 
       if (report.readAfterWrite.outstanding.length > 0) {

@@ -13,6 +13,7 @@ function report(t: Trigger): RunReport {
     source: t.source,
     skipped: null,
     dirtyOnEntry: false,
+    syncInterrupted: false,
     sync: null,
     readAfterWrite: { checked: false, expected: 0, outstanding: [], attempts: 0, reason: null },
     build: null,
