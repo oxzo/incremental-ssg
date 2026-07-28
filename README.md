@@ -98,6 +98,14 @@ Route paths are *not* trusted, and are validated: a slug containing `..` cannot
 write outside the output directory, and two routes cannot silently write one
 file. See `planOutputs` in `src/render.ts`.
 
+The output tree is not trusted to stay inside itself either. **A tree this build
+seals and deploys is regular files and directories** — a symlink anywhere under
+it is refused by name rather than followed, because following a directory link
+would publish an arbitrary subtree of the filesystem under a path in the site,
+and following a file link would put bytes in the seal that the tree does not own.
+Asset derivatives are *hardlinked*, which is a regular file and is unaffected.
+See `walk` in `src/hash-tree.ts`.
+
 ## Properties that are tested, not asserted in prose
 
 - **Two builds of one corpus are byte-identical.** Success criterion 1 stated as
@@ -375,7 +383,7 @@ object reads as modified on every deploy, forever.
 ## Checks
 
 ```sh
-npm test           # 268 tests
+npm test           # 276 tests
 npm run typecheck  # tsc, strict, no emit — Node strips types and checks nothing
 npm run test:mutate  # break each rail in turn; every one must fail a test
 npm audit --omit=dev

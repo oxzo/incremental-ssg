@@ -323,6 +323,31 @@ MUTATIONS: list[Mutation] = [
         "a seal that depends on walk order is a seal that disagrees with itself when the filesystem reorders",
         "test/deploy.test.ts",
     ),
+    # --- what counts as a tree -------------------------------------------------
+    #
+    # The walk in hash-tree.ts defines both what the seal binds and what the
+    # deploy publishes, so these two lines are the definition rather than a
+    # detail of a helper. Not mutated, and said so in the source: lstat over
+    # stat. Swapping them would break the import and kill on an unresolved name
+    # rather than on a missed defect, which is a kill for the wrong reason. The
+    # broken-symlink test pins it instead -- stat throws ENOENT there before
+    # anything can classify the entry.
+    Mutation(
+        "tree-symlink-followed",
+        "src/hash-tree.ts",
+        "      if (st.isSymbolicLink()) {",
+        "      if (false) {",
+        "one directory symlink in the output seals and publishes an arbitrary subtree of the filesystem",
+        "test/tree-walk.test.ts",
+    ),
+    Mutation(
+        "tree-nonregular-accepted",
+        "src/hash-tree.ts",
+        "      if (!st.isFile()) {",
+        "      if (false) {",
+        "readFileSync on a FIFO blocks forever, so the build stops with no error and no output",
+        "test/tree-walk.test.ts",
+    ),
     # --- content type transitions ---------------------------------------------
     Mutation(
         "sync-type-not-in-identity",

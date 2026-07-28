@@ -11,8 +11,9 @@
 // md5 for single-part uploads; hashing our side with sha256 and comparing
 // against that would report every object as modified, forever.
 import { createHash } from 'node:crypto'
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+import { readdirSync, readFileSync, lstatSync, existsSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
+import { RailError } from './rails.ts'
 
 /** Forward-slashed path relative to the tree root -> content digest. */
 export type TreeDigests = Map<string, string>
@@ -24,6 +25,27 @@ export type TreeDigests = Map<string, string>
  * one syscall per file against two, which is noise on a demo and is not on a
  * 24,000-route site where this runs on every build (the seal) and again on
  * every deploy.
+ *
+ * **A tree here is regular files and directories.** Anything else is refused by
+ * name, and a symlink is the case that matters: this walk defines what the seal
+ * binds and what the deploy publishes, so following one would put bytes in both
+ * that the tree does not own. A file link's target can change without anything
+ * under the root being touched, which makes the seal disagree with a build that
+ * did nothing wrong; a directory link is worse, because one of them publishes an
+ * arbitrary subtree of the filesystem under a path in the site. planOutputs()
+ * stopped a route writing outside the output tree, and this is the same hazard
+ * from the other end -- nothing stopped the deploy reading outside it.
+ *
+ * Refusing is cheap here for a reason that is about this tree rather than about
+ * symlinks: nothing in this pipeline creates one. Asset derivatives are
+ * hardlinked (src/assets.ts, with a copy fallback), the build lock hardlinks its
+ * staged file, and the renderer writes files. A site that wants linked content
+ * in its output copies it instead, and the refusal says so.
+ *
+ * The root is exempt, deliberately. `dir` is the path the caller named rather
+ * than something the build produced, and pointing --out at a symlinked volume is
+ * a decision somebody made at the command line. The rule is about what turns up
+ * *inside* a tree the build owns.
  */
 function walk(dir: string, visit: (abs: string, rel: string) => void) {
   if (!existsSync(dir)) return
@@ -32,12 +54,55 @@ function walk(dir: string, visit: (abs: string, rel: string) => void) {
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     for (const e of entries) {
       const p = join(d, e.name)
-      // A symlink reports neither isDirectory nor isFile, so it falls through to
-      // the stat below rather than being silently skipped or silently followed.
-      if (e.isDirectory()) rec(p)
-      else if (e.isFile()) visit(p, relative(dir, p).split(sep).join('/'))
-      else if (statSync(p).isDirectory()) rec(p)
-      else visit(p, relative(dir, p).split(sep).join('/'))
+      const rel = () => relative(dir, p).split(sep).join('/')
+      if (e.isDirectory()) {
+        rec(p)
+        continue
+      }
+      if (e.isFile()) {
+        visit(p, rel())
+        continue
+      }
+      // Neither, so this is a symlink -- or a dirent whose type the filesystem
+      // declined to report, which some network and fuse mounts do and which
+      // makes every is*() answer false, isSymbolicLink() included. One lstat
+      // settles both, and it is lstat rather than stat so the answer is about
+      // this entry instead of about whatever it points at. Only an entry that is
+      // already unusual pays for it; the per-file syscall count above is
+      // unchanged.
+      //
+      // lstat carries no mutation, on purpose, and is pinned by a test instead:
+      // the broken-link case passes only with lstat, because stat throws ENOENT
+      // before anything here can classify the entry. A mutation swapping the two
+      // would die on an unresolved import rather than on a missed defect, which
+      // is a kill for the wrong reason and worth less than the test.
+      const st = lstatSync(p)
+      if (st.isSymbolicLink()) {
+        throw new RailError(
+          'tree.symlink',
+          true,
+          `${rel()} is a symbolic link, and a tree this build seals and deploys is regular files ` +
+          `and directories. Following it would seal and publish bytes that live outside the tree ` +
+          `— for a directory link, an arbitrary amount of them. Copy the content in instead.`,
+        )
+      }
+      if (st.isDirectory()) {
+        rec(p)
+        continue
+      }
+      if (!st.isFile()) {
+        // A FIFO reaches readFileSync and blocks there, so the build stops with
+        // no error and no output -- the failure mode this project's own harness
+        // notes call worse than a crash. Sockets and device nodes are the same
+        // shape with different endings.
+        throw new RailError(
+          'tree.entry',
+          true,
+          `${rel()} is not a regular file or a directory, and a tree this build seals and deploys ` +
+          `is only those. Reading it would block or fail somewhere with less context than here.`,
+        )
+      }
+      visit(p, rel())
     }
   }
   rec(dir)
