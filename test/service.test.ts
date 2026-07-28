@@ -554,3 +554,84 @@ describe('pipeline', () => {
     }
   })
 })
+
+describe('service — --force-unlock is a rescue, not a mode', () => {
+  const fire = (): Trigger => ({ source: 'webhook', expectations: [], force: false })
+
+  test('it breaks the lock once and then stops breaking it', async () => {
+    // Held across runs, a one-time recovery flag becomes a standing licence to
+    // steal the lock from whatever legitimately holds it, for the lifetime of
+    // the process. The operator asks for one rescue at 3am and the service
+    // spends the next month ignoring the only thing preventing two writers.
+    const d = work('service-force-unlock')
+    const cms = await startMockCms(blogDocs({ posts: 2 }))
+    try {
+      const run = createPipeline({
+        site: BLOG,
+        dbPath: join(d, 'content.db'),
+        outDir: join(d, 'dist'),
+        workDir: d,
+        adapter: httpCmsAdapter({ baseUrl: cms.url }),
+        target: directoryTarget({ dir: join(d, 'remote') }),
+        workers: 1,
+        log: silentLog,
+        forceUnlock: true,
+      })
+
+      // A lock held by someone else. The first run is entitled to break it.
+      const stale = acquireLock(d, { label: 'a holder that is gone' })
+      const first = await run(fire())
+      assert.ok((first.deploy?.uploaded ?? 0) > 0, 'the rescue run must complete')
+
+      // Second run, same pipeline, same held lock: the rescue is spent.
+      const held = acquireLock(d, { label: 'a writer that is very much alive' })
+      await assert.rejects(() => run(fire()), /another writer holds the build lock/)
+      held.release()
+      stale.release()
+    } finally {
+      await cms.close()
+    }
+  })
+})
+
+describe('service — stopping settles what it accepted', () => {
+  test('a stop with work still pending resolves idle() and reports not-pending', async () => {
+    // quiet() requires `pending === null`, so leaving it set at shutdown left
+    // idle() waiting forever and status().pending true on a service that had
+    // stopped and would never run again. A shutdown that cannot report having
+    // shut down is worse than one that drops a trigger -- and the trigger is not
+    // the publish: the content is in the CMS and the watermark has not covered
+    // it, so the unconditional startup trigger finds it on the next start.
+    const d = work('service-stop-pending')
+    const runs: Trigger[] = []
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const service = createService({
+      // The first run blocks, so the second trigger has nowhere to go but
+      // `pending` -- which is the state this is about.
+      run: async (t: Trigger) => {
+        runs.push(t)
+        await gate
+        return {} as RunReport
+      },
+      debounceMs: 1,
+      pollMs: 0,
+      log: silentLog,
+    })
+    service.start()
+    await new Promise((r) => setTimeout(r, 30))
+    service.notify({ source: 'webhook', expectations: [] })
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(service.status().pending, true, 'the second trigger must be queued for this to mean anything')
+
+    release()
+    const stopped = service.stop()
+    // The assertion: this used to hang, because settle() never fired.
+    await Promise.race([
+      Promise.all([stopped, service.idle()]),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('stop()/idle() did not settle')), 3000)),
+    ])
+    assert.equal(service.status().pending, false)
+    assert.equal(d.length > 0, true)
+  })
+})

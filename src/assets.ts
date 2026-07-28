@@ -26,6 +26,7 @@ import { basename, join, relative, extname, sep } from 'node:path'
 import { AssetCache, defaultConfig } from './asset-cache.ts'
 import type { AssetEntry, AssetConfig, CacheStats } from './asset-cache.ts'
 import type { SiteAssets } from './config.ts'
+import { checkDisjointRoots } from './rails.ts'
 
 /** Formats sharp can decode that are worth treating as site imagery. */
 const SOURCE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif', '.tif', '.tiff', '.gif'])
@@ -87,6 +88,17 @@ export async function findSources(dir: string): Promise<string[]> {
 
 export async function runAssetStage(assets: SiteAssets): Promise<AssetStageResult> {
   const t0 = performance.now()
+  // Before a byte is read or written. The garbage collector below deletes
+  // everything in the derivative cache that this build did not produce, so if
+  // the cache and the sources are the same directory -- or one contains the
+  // other -- that sentence means deleting the user's original images. Nothing
+  // downstream can notice: the stage reports success, and the ratio ceiling does
+  // not fire because the derivatives outnumber the sources it just removed.
+  checkDisjointRoots([
+    { label: 'the asset source directory', path: assets.sources },
+    { label: 'the derivative cache', path: assets.outDir },
+    ...(assets.publishTo ? [{ label: 'the publish directory', path: assets.publishTo }] : []),
+  ])
   const cfg = resolveAssetConfig(assets)
   const cache = new AssetCache(cfg, assets.publicPath ?? '/assets/img')
   const sources = await findSources(assets.sources)

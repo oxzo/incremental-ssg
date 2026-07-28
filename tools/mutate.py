@@ -356,25 +356,17 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "clean-scope-unchecked",
         "src/build.ts",
-        "    if (p !== root && !p.startsWith(prefix)) continue",
+        "    if (!isInside(root, p)) continue",
         "    if (true) continue",
         "the shape this replaced: --clean is rm -rf on a caller-supplied path with nothing between it and the disk",
         "test/clean-scope.test.ts",
     ),
     Mutation(
         "clean-scope-root-slips",
-        "src/build.ts",
-        "  const prefix = root.endsWith(sep) ? root : root + sep",
-        "  const prefix = root + sep",
+        "src/rails.ts",
+        "  return c.startsWith(p.endsWith(sep) ? p : p + sep)",
+        "  return c.startsWith(p + sep)",
         "'/' + sep is '//' and matches nothing, so the single most destructive argument is the one that passes",
-        "test/clean-scope.test.ts",
-    ),
-    Mutation(
-        "clean-scope-prefix-unseparated",
-        "src/build.ts",
-        "!p.startsWith(prefix)",
-        "!p.startsWith(root)",
-        "/site/out-cache reads as inside /site/out, so the rail fires on a layout that was doing nothing wrong",
         "test/clean-scope.test.ts",
     ),
     # --- content type transitions ---------------------------------------------
@@ -441,6 +433,60 @@ MUTATIONS: list[Mutation] = [
         "    const digests = [...new Set(done.map((d) => String(d.routes)))]",
         "the shape this replaced: two workers resolving different route sets of equal length agree and the build ships the mixture",
         "test/route-plan.test.ts",
+    ),
+    # --- the second destructive path, and three rails that were simply absent --
+    #
+    # From an external review's second pass. The asset one is the dangerous one:
+    # the garbage collector deletes everything in its cache that this build did
+    # not produce, so a cache pointed at the sources deletes the originals --
+    # reproduced at three PNGs, all three gone, stage reporting success.
+    Mutation(
+        "assets-overlapping-roots-allowed",
+        "src/assets.ts",
+        "  checkDisjointRoots([",
+        "  if (false) checkDisjointRoots([",
+        "a derivative cache pointing at the source directory deletes the user's original images, which cannot be regenerated",
+        "test/clean-scope.test.ts",
+    ),
+    Mutation(
+        "roots-prefix-unseparated",
+        "src/rails.ts",
+        "  return c.startsWith(p.endsWith(sep) ? p : p + sep)",
+        "  return c.startsWith(p)",
+        "/site/img-cache reads as inside /site/img, so both scope rails fire on layouts that were doing nothing wrong",
+        "test/clean-scope.test.ts",
+    ),
+    Mutation(
+        "cli-sync-locks-the-wrong-dir",
+        "src/cli.ts",
+        "await withLock(dirname(dbPath), { label: 'cli sync'",
+        "await withLock(dirname(dirname(dbPath)), { label: 'cli sync'",
+        "sync mutates the store and flips its journal mode while a build's workers hold the same file open",
+        "test/serve-cli.test.ts",
+    ),
+    Mutation(
+        "service-force-unlock-persists",
+        "src/service.ts",
+        "    forceUnlockRemaining = false",
+        "    forceUnlockRemaining = true",
+        "a one-time lock rescue becomes a standing licence to steal the lock from a live writer, for the life of the process",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "service-stop-leaves-pending",
+        "src/service.ts",
+        "      if (pending !== null) {",
+        "      if (false) {",
+        "a stop with queued work never settles, so idle() waits forever and status() reports pending on a stopped service",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "determinism-skips-routes",
+        "src/build.ts",
+        "  const routes = runDeterministic('site.routes()', () => cfg.routes(site), mode)",
+        "  const routes = cfg.routes(site)",
+        "a clock read in routes() changes which pages exist, so a single-worker build seals a different tree every time",
+        "test/build.test.ts",
     ),
     # --- (type, id) is what identifies a document ------------------------------
     #

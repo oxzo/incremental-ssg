@@ -14,7 +14,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { checkCleanScope, clean } from '../src/build.ts'
-import { RailError } from '../src/rails.ts'
+import { runAssetStage } from '../src/assets.ts'
+import { makeImages } from '../example/blog/fixture.ts'
+import { checkDisjointRoots, RailError } from '../src/rails.ts'
 
 const roots: string[] = []
 after(() => roots.forEach((d) => rmSync(d, { recursive: true, force: true })))
@@ -110,5 +112,71 @@ describe('clean scope — allowed', () => {
     clean(out, [{ label: 'the document store', path: join(base, 'content.db') }])
     assert.equal(existsSync(out), false, 'the output directory is gone')
     assert.equal(existsSync(join(base, 'content.db')), true, 'and its neighbour is not')
+  })
+})
+
+// The other destructive path in this pipeline, and the one that reaches files
+// `--clean` never could. The asset stage's garbage collector deletes everything
+// in its derivative cache that the current build did not produce. Point the
+// cache at the source images and that means the originals -- reproduced before
+// this rail existed: three PNGs in, three PNGs deleted, stage reported success,
+// and the ratio ceiling never fired because the derivatives outnumbered them.
+describe('asset roots must be disjoint', () => {
+  const R = (p: string) => ({ label: p, path: p })
+
+  test('the cache being the source directory is refused', () => {
+    assert.throws(
+      () => checkDisjointRoots([R('/site/img'), R('/site/img')]),
+      (e: Error) => {
+        assert.ok(e instanceof RailError)
+        assert.equal(e.rail, 'assets.overlapping-roots')
+        // Terminal: a layout is a configuration, not a moment.
+        assert.equal(e.terminal, true)
+        assert.match(e.message, /the same directory as/)
+        return true
+      })
+  })
+
+  test('the cache inside the source directory is refused', () => {
+    assert.throws(() => checkDisjointRoots([R('/site/img'), R('/site/img/cache')]), /is inside/)
+  })
+
+  test('the source directory inside the cache is refused, which is the other order', () => {
+    // Containment is not symmetric in the message but must be in the check: a gc
+    // over /site/cache walks everything under it, sources included.
+    assert.throws(() => checkDisjointRoots([R('/site/cache/img'), R('/site/cache')]), /is inside/)
+  })
+
+  test('publishing into the sources is refused', () => {
+    assert.throws(
+      () => checkDisjointRoots([R('/site/img'), R('/site/cache'), R('/site/img')]),
+      /assets\.overlapping-roots|the same directory as/)
+  })
+
+  test('sibling directories sharing a prefix are allowed', () => {
+    // The negative control, and the case a naive startsWith gets wrong:
+    // /site/img-cache is not inside /site/img. A rail that fires on a correct
+    // layout costs more trust than the one it saves.
+    checkDisjointRoots([R('/site/img'), R('/site/img-cache'), R('/site/img-public')])
+  })
+
+  test('three genuinely separate roots are allowed', () => {
+    checkDisjointRoots([R('/a/sources'), R('/b/cache'), R('/c/publish')])
+  })
+})
+
+describe('the asset stage refuses before it reads or writes anything', () => {
+  test('an overlapping cache does not reach the garbage collector', async () => {
+    // The wiring, not the predicate. Without the call in runAssetStage the rule
+    // above is a function nobody invokes, and the originals go with the sweep --
+    // which is what this reproduced before the rail existed.
+    const dir = mkdtempSync(join(tmpdir(), 'assets-overlap-'))
+    roots.push(dir)
+    const sources = join(dir, 'img')
+    await makeImages(sources, ['keep-me.png'])
+    await assert.rejects(
+      () => runAssetStage({ sources, outDir: sources, gc: true }),
+      /assets\.overlapping-roots|deletes everything in its/)
+    assert.equal(existsSync(join(sources, 'keep-me.png')), true, 'the original must survive')
   })
 })

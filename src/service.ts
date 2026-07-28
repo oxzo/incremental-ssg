@@ -155,7 +155,16 @@ export type PipelineOptions = {
     /** Plan and report without touching the target. Leaves the dirty flag set. */
     dryRun?: boolean
   }
-  /** Break a held build lock. For recovering from a reused pid, not for routine use. */
+  /**
+   * Break a held build lock, once.
+   *
+   * For recovering from a reused pid, not for routine use -- and "once" is the
+   * whole of it. Held across runs, a one-time recovery flag becomes a standing
+   * licence to steal the lock from whatever legitimately holds it, for the
+   * lifetime of the process: the operator asks for one rescue at 3am and the
+   * service spends the next month ignoring the only thing preventing two
+   * concurrent writers. Consumed by the first run, per createPipeline.
+   */
   forceUnlock?: boolean
   log?: Log
 }
@@ -176,6 +185,9 @@ export function createPipeline(opts: PipelineOptions): Pipeline {
   const workDir = opts.workDir ?? dirname(opts.dbPath)
   const rawAttempts = Math.max(1, opts.readAfterWrite?.attempts ?? 3)
   const rawBackoff = Math.max(0, opts.readAfterWrite?.backoffMs ?? 500)
+  // Per pipeline, not per run. See PipelineOptions.forceUnlock: the flag is a
+  // one-time rescue, and a rescue that repeats is not a rescue.
+  let forceUnlockRemaining = opts.forceUnlock === true
 
   // Loaded once and cached: sync needs the site's content types, and re-importing
   // the module on every trigger would re-run its top level for nothing.
@@ -199,9 +211,15 @@ export function createPipeline(opts: PipelineOptions): Pipeline {
       ms: 0,
     }
 
+    // Consumed, not read. The flag answers "is the lock currently held by
+    // something that is gone", which is a fact about one moment -- so it is
+    // spent on the first attempt whether or not it was needed, and every run
+    // after this one takes the lock on the same terms as any other writer.
+    const force = forceUnlockRemaining
+    forceUnlockRemaining = false
     const lock = acquireLock(workDir, {
       label: `serve ${trigger.source}`,
-      force: opts.forceUnlock,
+      force,
     })
     try {
       const contentTypes = await types()
@@ -711,6 +729,25 @@ export function createService(opts: ServiceOptions): Service {
       if (retryTimer !== null) clearTimeout(retryTimer)
       pollTimer = timer = retryTimer = null
       await running
+      // Pending work is discarded here, explicitly, rather than left set.
+      //
+      // Leaving it was the bug: quiet() requires `pending === null`, so a stop
+      // with accepted-but-unrun work left idle() waiting forever and
+      // status().pending reporting true on a service that had stopped and would
+      // never run again. A shutdown that cannot report having shut down is worse
+      // than one that drops a trigger.
+      //
+      // Dropping it is safe rather than merely convenient, and the reason is
+      // worth stating because the trigger *was* acknowledged with a 202: nothing
+      // about the publish lives in this variable. The content is in the CMS and
+      // the watermark that has not covered it yet is in the store, so the
+      // unconditional startup trigger re-syncs and finds it on the next start --
+      // as does the next poll, if the process keeps running. What is lost is the
+      // debounce's head start, not the publish.
+      if (pending !== null) {
+        log({ event: 'service.pending-dropped', sources: [...pending.sources] })
+        pending = null
+      }
       settle()
       log({ event: 'service.stopped', runs, published, skipped })
     },

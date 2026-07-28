@@ -28,6 +28,8 @@
 // stuck condition marked transient produces a service that looks busy forever
 // while the site stays stale.
 
+import { resolve, sep } from 'node:path'
+
 export class RailError extends Error {
   readonly rail: string
   readonly terminal: boolean
@@ -106,4 +108,65 @@ export function checkNumber(
     `Refused rather than clamped: a value this far from usable is a mistake about ` +
     `what was intended, and guessing which limit was meant is how a typo becomes a ` +
     `silent policy change.`)
+}
+
+/**
+ * Is `child` the same path as `parent`, or inside it?
+ *
+ * One definition, because there are now two callers that must not disagree: the
+ * `--clean` scope check and the asset stage's root check. Both answer "would
+ * this operation reach that", and two spellings of that question would stay
+ * identical exactly until one of them was fixed -- the drift this codebase has
+ * already met in pool() and hash-tree.
+ *
+ * The separator on the prefix is the whole subtlety. `/` is already its own
+ * separator, so `'/' + sep` is `'//'` and matches nothing: written the obvious
+ * way, a scope check refuses every bad layout *except* the most destructive one.
+ * And the prefix is required rather than a bare startsWith, or `/site/out-cache`
+ * reads as inside `/site/out` and the rail fires on a layout doing nothing wrong.
+ *
+ * Compares resolved paths, not real ones: a symlink routing one path inside
+ * another is not detected here. Said plainly rather than implied.
+ */
+export function isInside(parent: string, child: string): boolean {
+  const p = resolve(parent)
+  const c = resolve(child)
+  if (c === p) return true
+  return c.startsWith(p.endsWith(sep) ? p : p + sep)
+}
+
+/** Two roots and what each is for, so a refusal can name them. */
+export type NamedRoot = { label: string; path: string }
+
+/**
+ * Refuse a set of directories that are not pairwise disjoint.
+ *
+ * The asset stage owns three of them -- the sources it reads, the derivative
+ * cache it writes, and where it publishes into the site -- and its garbage
+ * collector deletes everything in the cache that this build did not put there.
+ * Point the cache at the sources and that sentence reads: delete the user's
+ * original images. Measured before this existed, on three PNGs: all three gone,
+ * stage reported success, and the ratio ceiling never fired because the
+ * derivatives outnumbered them.
+ *
+ * Terminal. A layout is a configuration, not a moment; no retry rearranges it.
+ */
+export function checkDisjointRoots(roots: NamedRoot[]) {
+  for (let i = 0; i < roots.length; i++) {
+    for (let j = 0; j < roots.length; j++) {
+      if (i === j) continue
+      const a = roots[i]
+      const b = roots[j]
+      if (!isInside(a.path, b.path)) continue
+      const same = resolve(a.path) === resolve(b.path)
+      throw new RailError(
+        'assets.overlapping-roots',
+        true,
+        `${b.label} (${resolve(b.path)}) is ${same ? 'the same directory as' : 'inside'} ` +
+        `${a.label} (${resolve(a.path)}). Refused: the asset stage deletes everything in its ` +
+        `derivative cache that the current build did not produce, so an overlap here means ` +
+        `deleting files it does not own -- source images cannot be regenerated. Give each of ` +
+        `them its own directory.`)
+    }
+  }
 }

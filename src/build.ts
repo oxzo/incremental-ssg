@@ -18,10 +18,10 @@ import { DocumentStore } from './store.ts'
 import { loadSite } from './config.ts'
 import { runAssetStage, emptyManifest } from './assets.ts'
 import { createContextFactory, createRenderer, renderRoute, writeFile, planOutputs } from './render.ts'
-import { beginDeterministicWindow } from './determinism.ts'
+import { beginDeterministicWindow, runDeterministic } from './determinism.ts'
 import { clearSeal, writeSeal, SEAL_SCHEMA, SEAL_ALGORITHM } from './deploy.ts'
 import { scanTree, foldDigests } from './hash-tree.ts'
-import { checkNumber, RailError } from './rails.ts'
+import { checkNumber, isInside, RailError } from './rails.ts'
 import type { Route, SiteConfig } from './config.ts'
 import type { AssetManifest, AssetStageResult } from './assets.ts'
 import type { Renderer } from './render.ts'
@@ -108,9 +108,20 @@ export async function resolveSite(sitePath: string, dbPath: string): Promise<Res
   for (const list of docs.values()) documents += list.length
   const t1 = now()
 
-  const site = cfg.index(docs)
+  // Guarded, like the render is. The window used to open in renderRange, which
+  // left the two hooks that decide *what the site is* outside it -- and they are
+  // the ones where nondeterminism is least visible and most expensive. A clock
+  // read in routes() changes the route set, so the seal covers a different tree
+  // on every build and the deploy diff reports the whole site as modified.
+  //
+  // The parallel path has a partial backstop: workers must agree on a digest of
+  // the resolved route list, so a clock in routes() makes them disagree and the
+  // build refuses. A single-worker build has nothing to disagree with, so it
+  // silently emitted different bytes each time -- which is the case this closes.
+  const mode = cfg.determinism ?? 'enforce'
+  const site = runDeterministic('site.index()', () => cfg.index(docs), mode)
   const t2 = now()
-  const routes = cfg.routes(site)
+  const routes = runDeterministic('site.routes()', () => cfg.routes(site), mode)
   const t3 = now()
 
   return { cfg, site, routes, documents, ms: { load: t1 - t0, index: t2 - t1, routes: t3 - t2 } }
@@ -227,12 +238,14 @@ export type ProtectedPath = { label: string; path: string }
  */
 export function checkCleanScope(outDir: string, protect: ProtectedPath[]) {
   const root = resolve(outDir)
-  // `/` is already its own separator, and `'/' + sep` matches nothing -- which
-  // would make the single most destructive argument the one case that passed.
-  const prefix = root.endsWith(sep) ? root : root + sep
+  // The separator subtlety that used to live here -- `'/' + sep` is `'//'` and
+  // matches nothing, so the most destructive argument was the one case a naive
+  // prefix test passed -- now lives in isInside, which the asset stage's root
+  // check also uses. One definition, because two spellings of "would this reach
+  // that" stay identical exactly until one of them is fixed.
   for (const { label, path } of protect) {
     const p = resolve(path)
-    if (p !== root && !p.startsWith(prefix)) continue
+    if (!isInside(root, p)) continue
     throw new RailError(
       'build.clean-scope',
       true,

@@ -12,9 +12,12 @@
 // stage that can damage a live site, and serve is the only one that runs with
 // nobody reading its output.
 //
-// build, deploy and serve all take the build lock. A lock only the service
+// sync, build, deploy and serve all take the build lock. A lock only the service
 // respects would not be a lock -- the collision worth preventing is an operator
-// running `build` by hand while a scheduled publish is mid-render.
+// running `build` by hand while a scheduled publish is mid-render. Sync was the
+// omission: it is the other command that *writes* the store, and it also flips
+// the database into a shareable journal mode on its way out, which is a change
+// made underneath render workers that are reading the same file.
 import { parseArgs } from 'node:util'
 import type { ParseArgsConfig } from 'node:util'
 import { dirname, resolve } from 'node:path'
@@ -261,6 +264,7 @@ if (command === 'sync') {
     'no-reconcile': { type: 'boolean' },
     'no-delta': { type: 'boolean' },
     'no-id-listing': { type: 'boolean' },
+    'force-unlock': { type: 'boolean' },
   })
   const dbPath = resolve(need(values.db, 'db'))
   const baseUrl = need(values.cms, 'cms')
@@ -272,21 +276,27 @@ if (command === 'sync') {
     deltaSync: !values['no-delta'],
     idListing: !values['no-id-listing'],
   })
-  const store = new DocumentStore(dbPath)
-  try {
-    const r = await sync(adapter, store, {
-      pageSize: num(values['page-size'], 'page-size', { min: 1, integer: true }),
-      full: values.full,
-      reconcile: !values['no-reconcile'],
-      contentTypes,
-    })
-    console.log(
-      `${r.strategy}: ${r.pulled} pulled, ${r.changed} changed, ${r.deleted} deleted, ` +
-      `${r.requests} requests, ${(r.bytes / 1024 / 1024).toFixed(1)} MiB, ${ms(r.ms.total)}`)
-    if (r.deleted > 0) console.log(`  ${r.deleted} document(s) removed by the reconcile scan`)
-  } finally {
-    store.close()
-  }
+  // Under the lock, like every other writer. Sync mutates the store page by page
+  // and then calls prepareForReaders(), which changes the database's journal
+  // mode -- doing that while a build's workers hold the same file open is a
+  // change of the ground they are standing on.
+  const r = await withLock(dirname(dbPath), { label: 'cli sync', force: values['force-unlock'] }, async () => {
+    const store = new DocumentStore(dbPath)
+    try {
+      return await sync(adapter, store, {
+        pageSize: num(values['page-size'], 'page-size', { min: 1, integer: true }),
+        full: values.full,
+        reconcile: !values['no-reconcile'],
+        contentTypes,
+      })
+    } finally {
+      store.close()
+    }
+  })
+  console.log(
+    `${r.strategy}: ${r.pulled} pulled, ${r.changed} changed, ${r.deleted} deleted, ` +
+    `${r.requests} requests, ${(r.bytes / 1024 / 1024).toFixed(1)} MiB, ${ms(r.ms.total)}`)
+  if (r.deleted > 0) console.log(`  ${r.deleted} document(s) removed by the reconcile scan`)
 } else if (command === 'build') {
   const values = parse({
       site: { type: 'string' },

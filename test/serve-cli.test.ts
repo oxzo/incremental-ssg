@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path'
 import { startMockCms } from '../src/cms-mock.ts'
 import { blogDocs } from '../example/blog/fixture.ts'
 import { tmpdir, cleanup } from './fixture.ts'
+import { acquireLock } from '../src/build-lock.ts'
 
 const REPO = resolve(import.meta.dirname, '..')
 const CLI = resolve(REPO, 'src/cli.ts')
@@ -216,5 +217,43 @@ describe('serve command', () => {
     // no payload, so this has to fail at startup and not merely warn.
     assert.equal(code, 1)
     assert.match(out, /refuses to start with no authentication/)
+  })
+})
+
+// sync writes the store and, on its way out, flips the database into a
+// shareable journal mode. Both are changes made underneath whatever else has
+// the file open, so it belongs under the same lock as every other writer -- and
+// it was the one mutating command that did not take it.
+describe('cli sync takes the build lock', () => {
+  const run = (args: string[], cwd: string) =>
+    new Promise<{ code: number; err: string }>((res) => {
+      const child = spawn(process.execPath, ['--no-warnings', CLI, ...args], {
+        cwd, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let err = ''
+      child.stderr.on('data', (d) => { err += String(d) })
+      child.stdout.on('data', () => {})
+      child.on('exit', (code) => res({ code: code ?? -1, err }))
+    })
+
+  test('refuses while another writer holds it, and succeeds once released', async () => {
+    const dir = tmpdir('cli-sync-lock')
+    dirs.push(dir)
+    const cms = await startMockCms(blogDocs({ posts: 2 }))
+    try {
+      const dbPath = join(dir, 'content.db')
+      const held = acquireLock(dir, { label: 'a build already running' })
+      const blocked = await run(['sync', '--db', dbPath, '--cms', cms.url], REPO)
+      assert.notEqual(blocked.code, 0, 'sync must not write while another writer holds the lock')
+      assert.match(blocked.err, /another writer holds the build lock/)
+
+      // The negative control in the same test: the refusal has to be about the
+      // lock, not about the command being broken.
+      held.release()
+      const ok = await run(['sync', '--db', dbPath, '--cms', cms.url], REPO)
+      assert.equal(ok.code, 0, ok.err)
+    } finally {
+      await cms.close()
+    }
   })
 })

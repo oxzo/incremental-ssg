@@ -14,6 +14,7 @@ const BLOG_ASSETS = resolve(import.meta.dirname, 'sites/blog-assets.ts')
 const BLOG_HIGHLIGHT = resolve(import.meta.dirname, 'sites/blog-highlight.ts')
 const UNSTABLE = resolve(import.meta.dirname, 'sites/unstable-routes.ts')
 const FAILING_WORKER = resolve(import.meta.dirname, 'sites/failing-worker.ts')
+const STAMPED_ROUTES = resolve(import.meta.dirname, 'sites/stamped-routes.ts')
 
 // The asset-site module reads these at import time and ESM caches it, so they
 // are fixed once for the whole file rather than per test.
@@ -254,6 +255,24 @@ describe('build — failure modes', () => {
       () => build({ site: STAMPED_ENFORCE, dbPath: stampDb, outDir: out, workers: 2 }),
       /DeterminismError.*Date\.now\(\)/s,
     )
+  })
+
+  test('a routes() hook reaching for the wall clock fails the build', async () => {
+    // The gap the window used to have: it opened inside renderRange, so the two
+    // hooks that decide what the site *is* ran outside it. A single worker is
+    // the case with no backstop -- the cross-worker route-digest check catches
+    // this in parallel mode, for a different reason and with a different error.
+    const out = join(work('build-stamped-routes'), 'dist')
+    await assert.rejects(
+      () => build({ site: STAMPED_ROUTES, dbPath: stampDb, outDir: out, workers: 1 }),
+      /Date\.now\(\)|deterministic/i)
+  })
+
+  test('the same site is caught in parallel mode too, by whichever rail gets there first', async () => {
+    const out = join(work('build-stamped-routes-par'), 'dist')
+    await assert.rejects(
+      () => build({ site: STAMPED_ROUTES, dbPath: stampDb, outDir: out, workers: 2 }),
+      /Date\.now\(\)|deterministic|disagree/i)
   })
 
   test("determinism:'off' really opts out", async () => {
