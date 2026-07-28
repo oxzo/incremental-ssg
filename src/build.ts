@@ -13,7 +13,7 @@ import { Worker } from 'node:worker_threads'
 import { cpus } from 'node:os'
 import { rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { DocumentStore } from './store.ts'
 import { loadSite } from './config.ts'
 import { runAssetStage, emptyManifest } from './assets.ts'
@@ -21,7 +21,7 @@ import { createContextFactory, createRenderer, renderRoute, writeFile, planOutpu
 import { beginDeterministicWindow } from './determinism.ts'
 import { clearSeal, writeSeal, SEAL_SCHEMA, SEAL_ALGORITHM } from './deploy.ts'
 import { scanTree, foldDigests } from './hash-tree.ts'
-import { checkNumber } from './rails.ts'
+import { checkNumber, RailError } from './rails.ts'
 import type { Route, SiteConfig } from './config.ts'
 import type { AssetManifest, AssetStageResult } from './assets.ts'
 import type { Renderer } from './render.ts'
@@ -206,7 +206,56 @@ export type WorkerReport = {
   ms: Resolved['ms']
 }
 
-export function clean(outDir: string) {
+/** Something a `--clean` build must not delete, and a name to refuse it by. */
+export type ProtectedPath = { label: string; path: string }
+
+/**
+ * Whether `--clean` would take something with it, decided without deleting
+ * anything.
+ *
+ * Separated from `clean` for two reasons, and the second is the important one.
+ * It is a pure check, so it is directly testable -- and a test of the *dangerous*
+ * cases must never be one rmSync away from being right. Asserting that this
+ * refuses `--out /` costs nothing; asserting it by calling `clean('/')` and
+ * hoping is a test whose failure mode is the filesystem.
+ *
+ * The comparison is between resolved paths, not real paths. A symlink routing
+ * one of these inside the output directory is not detected here, and saying so
+ * beats implying a coverage that does not exist: the tree walk in hash-tree.ts
+ * refuses links it finds *inside* the tree, which is a different question from
+ * where the tree's own neighbours live.
+ */
+export function checkCleanScope(outDir: string, protect: ProtectedPath[]) {
+  const root = resolve(outDir)
+  // `/` is already its own separator, and `'/' + sep` matches nothing -- which
+  // would make the single most destructive argument the one case that passed.
+  const prefix = root.endsWith(sep) ? root : root + sep
+  for (const { label, path } of protect) {
+    const p = resolve(path)
+    if (p !== root && !p.startsWith(prefix)) continue
+    throw new RailError(
+      'build.clean-scope',
+      true,
+      `--clean would delete ${label} (${p}), which is inside the output directory (${root}). ` +
+      `Refused: the output directory is the one thing this build is allowed to throw away, and ` +
+      `everything else here either costs an hour to regenerate or cannot be regenerated at all. ` +
+      `Move it outside ${root}, or build without --clean.`,
+    )
+  }
+}
+
+/**
+ * Empty the output directory, having established that it holds nothing else.
+ *
+ * The protected set is a parameter rather than a lookup so that cleaning without
+ * naming what must survive is not something a caller can do by omission. The
+ * README asked for one of these in prose -- keep the asset cache outside the
+ * output directory or every clean build throws away an hour of encoding -- which
+ * is the shape this whole arc keeps finding: the capability to state a rule,
+ * spent on stating it somewhere the code cannot read.
+ */
+export function clean(outDir: string, protect: ProtectedPath[]) {
+  checkCleanScope(outDir, protect)
   rmSync(outDir, { recursive: true, force: true })
 }
 
@@ -216,7 +265,28 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   const dbPath = resolve(opts.dbPath)
   const outDir = resolve(opts.outDir)
   const workDir = resolve(opts.workDir ?? dirname(dbPath))
-  if (opts.clean) clean(outDir)
+
+  // The site is loaded before anything is deleted, which is a change of order
+  // rather than of steps. Two things follow from it: the clean can be checked
+  // against the asset paths the site declares, which are only knowable from
+  // here; and a build that cannot start -- a site module that fails to import,
+  // or declares no routes -- no longer takes the last good output with it on the
+  // way out.
+  const cfgProbe = await loadSite(sitePath)
+
+  if (opts.clean) {
+    clean(outDir, [
+      { label: 'the site module', path: sitePath },
+      { label: 'the document store', path: dbPath },
+      { label: "the build's work directory", path: workDir },
+      ...(cfgProbe.assets
+        ? [
+            { label: 'the asset derivative cache', path: cfgProbe.assets.outDir },
+            { label: 'the asset source directory', path: cfgProbe.assets.sources },
+          ]
+        : []),
+    ])
+  }
 
   // Drop any previous seal before emitting a byte. A build that dies halfway
   // must leave no seal behind, or the next deploy reads the *last* build's
@@ -227,7 +297,6 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   // The asset stage runs on the main thread before any route renders, so
   // `ctx.image()` can be a synchronous lookup and every derivative exists
   // exactly once. See src/assets.ts for why it is a stage and not a callback.
-  const cfgProbe = await loadSite(sitePath)
   let assets: AssetStageResult | null = null
   let manifestPath: string | null = null
   const ta = now()

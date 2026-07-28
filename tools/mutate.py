@@ -348,6 +348,35 @@ MUTATIONS: list[Mutation] = [
         "readFileSync on a FIFO blocks forever, so the build stops with no error and no output",
         "test/tree-walk.test.ts",
     ),
+    # --- what --clean is allowed to delete -------------------------------------
+    #
+    # Mutated through checkCleanScope, which deletes nothing. Breaking a rail
+    # whose subject is rm -rf has to be safe to do on purpose, or the harness
+    # becomes the most dangerous thing in the repository.
+    Mutation(
+        "clean-scope-unchecked",
+        "src/build.ts",
+        "    if (p !== root && !p.startsWith(prefix)) continue",
+        "    if (true) continue",
+        "the shape this replaced: --clean is rm -rf on a caller-supplied path with nothing between it and the disk",
+        "test/clean-scope.test.ts",
+    ),
+    Mutation(
+        "clean-scope-root-slips",
+        "src/build.ts",
+        "  const prefix = root.endsWith(sep) ? root : root + sep",
+        "  const prefix = root + sep",
+        "'/' + sep is '//' and matches nothing, so the single most destructive argument is the one that passes",
+        "test/clean-scope.test.ts",
+    ),
+    Mutation(
+        "clean-scope-prefix-unseparated",
+        "src/build.ts",
+        "!p.startsWith(prefix)",
+        "!p.startsWith(root)",
+        "/site/out-cache reads as inside /site/out, so the rail fires on a layout that was doing nothing wrong",
+        "test/clean-scope.test.ts",
+    ),
     # --- content type transitions ---------------------------------------------
     Mutation(
         "sync-type-not-in-identity",

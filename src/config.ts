@@ -66,9 +66,12 @@ export type SiteAssets = {
    * keep between builds: Phase 2c measured a warm build at 33ms against 4.23s
    * cold, and extrapolated 27s against 59min at 20,000 sources.
    *
-   * Keep this OUTSIDE the site output directory. If it lives under `outDir`,
-   * every `clean: true` build throws the cache away and pays the cold cost
-   * again, which is the entire win of Phase 2c deleted by a convenience flag.
+   * Keep this OUTSIDE the site output directory. A `clean: true` build with the
+   * cache under `outDir` is refused rather than run -- it would throw the cache
+   * away and pay the cold cost again, which is the entire win of Phase 2c
+   * deleted by a convenience flag. This used to be a warning here and nowhere
+   * else; `checkCleanScope` in src/build.ts is the same sentence somewhere the
+   * build can read it.
    */
   outDir: string
   /**

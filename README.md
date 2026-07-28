@@ -143,9 +143,12 @@ Two rails, both learned by deleting live files during Phase 2c:
 reconcile scan that fails halfway returns a short list, and trusting it
 unpublishes the site while the logs still say "sync complete".
 
-Keep the cache directory **outside** the output directory, or every `clean`
-build throws away work that costs ~59 minutes to regenerate at 20,000 sources.
-Derivatives are hardlinked into the output at publish time.
+Keep the cache directory **outside** the output directory. A `--clean` build
+that would delete it is refused rather than run — along with one that would take
+the document store, the site module, or the asset sources with it, since `clean`
+is `rm -rf` on a path the caller supplied. Derivatives are hardlinked into the
+output at publish time, so `publishTo` is the one asset path that belongs
+*inside* the output.
 
 ## Deploy diff
 
@@ -383,7 +386,7 @@ object reads as modified on every deploy, forever.
 ## Checks
 
 ```sh
-npm test           # 276 tests
+npm test           # 285 tests
 npm run typecheck  # tsc, strict, no emit — Node strips types and checks nothing
 npm run test:mutate  # break each rail in turn; every one must fail a test
 npm audit --omit=dev
