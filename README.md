@@ -9,10 +9,21 @@ diff that uploads only the files an edit actually changed.
 No build step: Node's native type stripping runs the TypeScript directly.
 
 ```sh
-npm test          # 161 tests
+npm test          # 211 tests
 npm run demo      # mock CMS -> sync -> assets -> render -> write -> deploy
 npm run cli help
 ```
+
+## Demo
+
+A public site that a CMS edit visibly rebuilds: Directus and the publish service
+run locally, the built site lives in Cloudflare R2, and a small Worker serves it.
+An editor saves, a webhook fires, the site is rebuilt, and only the changed files
+are uploaded — usually single digits out of a few thousand.
+
+Setup and the runbook are in `demo/README.md`. Nothing in the pipeline is
+demo-specific: R2 speaks the S3 API, so `--to s3://<bucket>` reaches it through
+the same target that reaches MinIO in `stack/`.
 
 ## Why there is no incremental engine
 

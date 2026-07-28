@@ -3,3 +3,9 @@ node_modules/
 .tmp/
 .cache/
 example/blog/images/
+
+# Real credentials for the demo's R2 bucket. stack/env.sh is committed because it
+# holds throwaway fixtures; this one is not, because it does not.
+stack/env.r2.sh
+demo/worker/node_modules/
+demo/worker/.wrangler/

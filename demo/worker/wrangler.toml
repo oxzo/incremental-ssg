@@ -1,0 +1,13 @@
+name = "incremental-ssg-demo"
+main = "src/index.ts"
+compatibility_date = "2026-07-28"
+
+# Served at https://incremental-ssg-demo.<your-subdomain>.workers.dev
+workers_dev = true
+
+# The bucket `cli serve --to s3://...` deploys into. The binding is what lets the
+# Worker read it without credentials: no S3 keys reach the edge, and the Worker
+# has read access only because it never calls put or delete.
+[[r2_buckets]]
+binding = "SITE"
+bucket_name = "incremental-ssg-demo"

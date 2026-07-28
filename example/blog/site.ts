@@ -76,7 +76,7 @@ export function index(docs: DocsByType): BlogIndex {
  * have saved the publish case.
  */
 export function routes(site: BlogIndex): Route[] {
-  const out: Route[] = [{ kind: 'home', path: '/' }]
+  const out: Route[] = [{ kind: 'home', path: '/' }, { kind: 'about', path: '/about/' }]
 
   for (const p of site.posts) out.push({ kind: 'post', path: `/posts/${p.slug}/`, id: p.id })
 

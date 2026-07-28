@@ -14,8 +14,9 @@
 // offset -- and an offset page that drifts mid-pull does not merely skip a
 // document, it feeds an incomplete id set to DocumentStore.deleteMissing and
 // unpublishes it.
+import { join } from 'node:path'
 import { S3Client, CreateBucketCommand, HeadBucketCommand } from '@aws-sdk/client-s3'
-import { blogDocs } from '../example/blog/fixture.ts'
+import { blogDocs, makeImages } from '../example/blog/fixture.ts'
 
 const env = (k: string, fallback?: string): string => {
   const v = process.env[k] ?? fallback
@@ -237,7 +238,18 @@ async function ensureFlows(collections: string[]): Promise<void> {
 // --- corpus ------------------------------------------------------------------
 
 async function seedCorpus(posts: number): Promise<void> {
-  const docs = blogDocs({ posts, tags: 5, authors: 3, pages: 2, paras: 2, code: true })
+  // Real image files, and real hero references on the posts.
+  //
+  // Without heroes the asset stage still runs and still encodes every source --
+  // it processes the directory, not the references -- but nothing on the site
+  // links to a derivative, so the most expensive part of the build (Phase 2b
+  // measured images at ~3,200x the render) is invisible to anyone looking at it.
+  // Assigning heroes is what puts <picture>, srcset and content-addressed
+  // filenames on the page where a demo can see them.
+  const heroes = await makeImages(join(import.meta.dirname, '../example/blog/images'), [
+    'hero-a.jpg', 'hero-b.jpg', 'hero-c.jpg',
+  ])
+  const docs = blogDocs({ posts, tags: 5, authors: 3, pages: 2, paras: 2, code: true, heroes })
   const byType = new Map<string, any[]>()
   for (const d of docs) {
     const { id, updated_at, rev, ...rest } = d.doc as any
