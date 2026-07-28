@@ -9,7 +9,7 @@ diff that uploads only the files an edit actually changed.
 No build step: Node's native type stripping runs the TypeScript directly.
 
 ```sh
-npm test          # 211 tests
+npm test          # the suite; counts and the rest of the gate live under Checks
 npm run demo      # mock CMS -> sync -> assets -> render -> write -> deploy
 npm run cli help
 ```
