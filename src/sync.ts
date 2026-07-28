@@ -9,6 +9,7 @@
 // adapter will serve, hash everything, and let the store decide what actually
 // changed.
 import { createHash } from 'node:crypto'
+import { checkNumber } from './rails.ts'
 import type { CmsAdapter, CmsDocument } from './cms.ts'
 import type { DocumentStore, UpsertInput } from './store.ts'
 
@@ -102,7 +103,11 @@ export async function sync(
   store: DocumentStore,
   opts: SyncOptions = {},
 ): Promise<SyncResult> {
-  const pageSize = opts.pageSize ?? 500
+  // A NaN page size reaches the adapter as `limit=NaN`, which a CMS is free to
+  // interpret as it likes -- the mock returns an empty slice, so sync completes
+  // having pulled nothing, and the reconcile scan then sees an empty `seen` set
+  // and proposes deleting the entire mirror.
+  const pageSize = checkNumber(opts.pageSize, 500, { name: 'pageSize', min: 1, integer: true })
   const wantTypes = opts.contentTypes ? new Set(opts.contentTypes) : null
   const t0 = now()
 

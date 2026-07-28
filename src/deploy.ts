@@ -25,7 +25,7 @@ import { readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { join, extname } from 'node:path'
 import { hashTree, statTree } from './hash-tree.ts'
 import { pool } from './pool.ts'
-import { RailError } from './rails.ts'
+import { RailError, checkNumber } from './rails.ts'
 import type { TreeDigests } from './hash-tree.ts'
 
 /** Bumped when a change here makes an existing seal file unreadable. */
@@ -270,7 +270,18 @@ export function contentTypeFor(path: string): string {
 export async function deploy(opts: DeployOptions): Promise<DeployResult> {
   const t0 = now()
   const { outDir, target } = opts
-  const { maxDeleteRatio = 0.5, force = false } = opts
+  const { force = false } = opts
+  // Checked before anything is read or listed, because the rail below is a
+  // comparison and a comparison against NaN is false -- an unparsed ratio does
+  // not raise here, it silently removes the ceiling.
+  const maxDeleteRatio = checkNumber(opts.maxDeleteRatio, 0.5, {
+    name: 'maxDeleteRatio', min: 0, max: 1,
+  })
+  // Checked here too, rather than where it is used further down, so a bad value
+  // refuses before this function has read a byte or listed the target.
+  const concurrency = checkNumber(opts.concurrency, 8, {
+    name: 'concurrency', min: 1, integer: true,
+  })
 
   const seal = opts.seal ?? (opts.workDir ? readSeal(opts.workDir) : null)
   if (!seal) {
@@ -373,7 +384,12 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
       bytes += body.byteLength
       await target.put(path, body, contentTypeFor(path))
     }),
-    Math.max(1, opts.concurrency ?? 8),
+    // Validated at the top rather than clamped with Math.max(1, …), which passes
+    // NaN straight through: pool() then sizes its worker array from NaN, gets
+    // zero workers, runs no uploads at all, and returns cleanly. A deploy that
+    // uploads nothing and reports success is the same silent-stale failure the
+    // rails above exist to prevent.
+    concurrency,
   )
   const uploadMs = now() - tu
 

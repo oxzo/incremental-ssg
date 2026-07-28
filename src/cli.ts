@@ -102,6 +102,48 @@ const ms = (n: number) => `${n.toFixed(0)}ms`
 const need = (v: string | undefined, flag: string) => v ?? fail(`--${flag} is required`)
 
 /**
+ * Parse a numeric flag, or refuse before anything runs.
+ *
+ * `Number(values[flag])` was the shape here, and it is the reason this function
+ * exists rather than a style preference. `Number('nonsense')` is NaN, NaN
+ * propagates silently through every option that carries it, and every threshold
+ * in this codebase is enforced by a comparison -- all of which are false against
+ * NaN. So `--max-delete-ratio nonsense` did not fail and did not clamp: it
+ * removed the mass-deletion ceiling and let the sweep through, reporting
+ * success. `--workers nope` built a pool of zero workers and sealed an empty
+ * site. Neither raised anything.
+ *
+ * The library guards the same values again at each use site (see checkNumber in
+ * src/rails.ts), because the CLI is not the only caller -- the service passes
+ * its own configuration straight down, and a rail that a caller's typo can
+ * switch off is not a rail. Checking twice is the point, not duplication.
+ *
+ * Refusing rather than falling back to the default: a value that cannot be
+ * parsed means the operator intended *something*, and quietly substituting a
+ * default publishes under a policy nobody chose.
+ */
+function num(
+  raw: string | undefined,
+  flag: string,
+  o: { min: number; max?: number; integer?: boolean },
+): number | undefined {
+  if (raw === undefined) return undefined
+  // Number('') and Number('  ') are both 0, which would turn `--workers ''`
+  // into a meaningful value rather than an obvious mistake.
+  if (raw.trim() === '') fail(`--${flag} was given an empty value`)
+  const n = Number(raw)
+  if (!Number.isFinite(n)) fail(`--${flag} must be a number, got "${raw}"`)
+  if (o.integer && !Number.isInteger(n)) fail(`--${flag} must be a whole number, got ${n}`)
+  if (n < o.min) fail(`--${flag} must be at least ${o.min}, got ${n}`)
+  if (o.max !== undefined && n > o.max) fail(`--${flag} must be at most ${o.max}, got ${n}`)
+  return n
+}
+
+/** Milliseconds: whole, non-negative, and 0 means "off" for --poll. */
+const msFlag = (raw: string | undefined, flag: string) =>
+  num(raw, flag, { min: 0, integer: true })
+
+/**
  * Pick a CMS adapter from --cms.
  *
  * The scheme selects the implementation, so one flag names both which service
@@ -209,7 +251,7 @@ if (command === 'sync') {
   const store = new DocumentStore(dbPath)
   try {
     const r = await sync(adapter, store, {
-      pageSize: values['page-size'] ? Number(values['page-size']) : undefined,
+      pageSize: num(values['page-size'], 'page-size', { min: 1, integer: true }),
       full: values.full,
       reconcile: !values['no-reconcile'],
       contentTypes,
@@ -240,7 +282,7 @@ if (command === 'sync') {
       site: resolve(need(values.site, 'site')),
       dbPath,
       outDir: resolve(need(values.out, 'out')),
-      workers: values.workers ? Number(values.workers) : undefined,
+      workers: num(values.workers, 'workers', { min: 1, integer: true }),
       clean: values.clean,
       skipAssets: values['skip-assets'],
     })).catch(die)
@@ -295,8 +337,8 @@ if (command === 'sync') {
       dryRun: values['dry-run'],
       force: values.force,
       purgeAdded: values['purge-added'],
-      maxDeleteRatio: values['max-delete-ratio'] ? Number(values['max-delete-ratio']) : undefined,
-      concurrency: values.concurrency ? Number(values.concurrency) : undefined,
+      maxDeleteRatio: num(values['max-delete-ratio'], 'max-delete-ratio', { min: 0, max: 1 }),
+      concurrency: num(values.concurrency, 'concurrency', { min: 1, integer: true }),
     })).catch(die)
   const p = r.plan
   console.log(
@@ -360,22 +402,22 @@ if (command === 'sync') {
     workDir,
     adapter,
     target,
-    workers: values.workers ? Number(values.workers) : undefined,
-    pageSize: values['page-size'] ? Number(values['page-size']) : undefined,
+    workers: num(values.workers, 'workers', { min: 1, integer: true }),
+    pageSize: num(values['page-size'], 'page-size', { min: 1, integer: true }),
     forceUnlock: values['force-unlock'],
     deploy: {
       dryRun: values['dry-run'],
       purgeAdded: values['purge-added'],
-      maxDeleteRatio: values['max-delete-ratio'] ? Number(values['max-delete-ratio']) : undefined,
+      maxDeleteRatio: num(values['max-delete-ratio'], 'max-delete-ratio', { min: 0, max: 1 }),
     },
   })
 
   const service = createService({
     run: pipeline,
     lockDir: workDir,
-    debounceMs: values.debounce ? Number(values.debounce) : undefined,
-    maxDelayMs: values['max-delay'] ? Number(values['max-delay']) : undefined,
-    pollMs: values.poll ? Number(values.poll) : undefined,
+    debounceMs: msFlag(values.debounce, 'debounce'),
+    maxDelayMs: msFlag(values['max-delay'], 'max-delay'),
+    pollMs: msFlag(values.poll, 'poll'),
     buildOnStart: values['build-on-start'],
   })
 
@@ -384,7 +426,7 @@ if (command === 'sync') {
   const http = await startWebhookServer({
     service,
     adapter,
-    port: values.port ? Number(values.port) : 8787,
+    port: num(values.port, 'port', { min: 0, max: 65535, integer: true }) ?? 8787,
     host: values.host,
     path: values.path,
     secret: process.env.WEBHOOK_SECRET ?? values.secret,

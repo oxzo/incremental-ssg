@@ -222,6 +222,36 @@ MUTATIONS: list[Mutation] = [
         "sync records the interrupted write and the pipeline skips anyway, which is the whole defect with an extra step",
         "test/service.test.ts",
     ),
+    # --- numbers that failed to parse -----------------------------------------
+    #
+    # These matter more than their size suggests. Every limit in this codebase is
+    # a comparison, and every comparison against NaN is false, so one unparsed
+    # option does not fail loudly -- it removes a rail while everything reports
+    # success. Each mutation below restores the exact shape the code had before.
+    Mutation(
+        "numbers-nan-accepted",
+        "src/rails.ts",
+        "    Number.isFinite(value) &&",
+        "    true &&",
+        "NaN reaching a threshold turns every comparison enforcing it false, which reads as no limit",
+        "test/numeric-guards.test.ts",
+    ),
+    Mutation(
+        "numbers-range-ignored",
+        "src/rails.ts",
+        "    value >= o.min &&",
+        "    true &&",
+        "a zero worker count or a negative delete ratio is a policy nobody chose, arriving silently",
+        "test/numeric-guards.test.ts",
+    ),
+    Mutation(
+        "cli-number-unvalidated",
+        "src/cli.ts",
+        '  if (!Number.isFinite(n)) fail(`--${flag} must be a number, got "${raw}"`)',
+        "  if (false) fail(`--${flag} must be a number`)",
+        "the original defect: a typo in a numeric flag reaches the rails as NaN instead of being refused",
+        "test/numeric-guards.test.ts",
+    ),
     # --- the injection proxy, which is test infrastructure that can also lie ---
     Mutation(
         "proxy-truncation-is-a-noop",

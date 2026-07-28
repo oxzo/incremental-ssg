@@ -57,3 +57,53 @@ export function isTerminal(e: unknown): boolean {
 export function railOf(e: unknown): string | null {
   return e instanceof RailError ? e.rail : null
 }
+
+/**
+ * A configured number that must be usable, or a terminal refusal.
+ *
+ * This lives beside the rails rather than in a utility module because it exists
+ * for one specific reason, and the reason is a property of how every rail here
+ * is written. They are all comparisons -- `deleted / live > maxDeleteRatio`,
+ * `width >= 1` -- and every comparison against NaN is false. So a single option
+ * that failed to parse does not produce a wrong answer or an error. It produces
+ * a rail that quietly stops firing, which is the failure mode this project
+ * treats as worse than a crash.
+ *
+ * Measured, not hypothesised: `--max-delete-ratio not-a-number` reached the
+ * deploy as NaN, the mass-deletion ceiling compared against it and passed, and
+ * nine of ten live objects were deleted with no force flag and no warning. The
+ * same shape appears wherever a count is trusted -- a NaN worker count builds a
+ * pool of zero workers and seals an empty site, and a NaN upload concurrency
+ * runs zero uploads and reports success.
+ *
+ * Terminal, because a value from a flag or a config file arrives identical on
+ * every retry. A service retrying this would loop forever on a typo while the
+ * site went stale.
+ */
+export function checkNumber(
+  value: number | undefined,
+  fallback: number,
+  o: { name: string; min: number; max?: number; integer?: boolean },
+): number {
+  if (value === undefined) return fallback
+  const ok =
+    // Redundant at every call site as they stand -- each bounds its value with a
+    // max or an integer rule, and both of those reject NaN and Infinity on their
+    // own (`NaN >= min` is false). Kept because it is the clause that states the
+    // contract rather than relying on one being supplied, and it is the only
+    // guard an unbounded fractional option would have. Tested directly in
+    // test/numeric-guards.test.ts, since no caller can exercise it.
+    Number.isFinite(value) &&
+    value >= o.min &&
+    (o.max === undefined || value <= o.max) &&
+    (o.integer !== true || Number.isInteger(value))
+  if (ok) return value
+  const range = o.max === undefined ? `at least ${o.min}` : `between ${o.min} and ${o.max}`
+  throw new RailError(
+    'invalid-number',
+    true,
+    `${o.name} must be ${o.integer ? 'a whole number' : 'a number'} ${range}, got ${value}. ` +
+    `Refused rather than clamped: a value this far from usable is a mistake about ` +
+    `what was intended, and guessing which limit was meant is how a typo becomes a ` +
+    `silent policy change.`)
+}

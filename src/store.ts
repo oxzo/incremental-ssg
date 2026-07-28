@@ -7,7 +7,7 @@
 // the CMS", which a re-sync fixes, rather than "the cache disagrees with the
 // content", which nothing fixes.
 import { DatabaseSync } from 'node:sqlite'
-import { RailError } from './rails.ts'
+import { RailError, checkNumber } from './rails.ts'
 import type { Doc, DocsByType } from './config.ts'
 
 /** Bumped when a change here makes an existing database file unreadable. */
@@ -167,7 +167,14 @@ export class DocumentStore {
    * -- so refuse an implausibly large sweep instead of trusting the caller.
    */
   deleteMissing(live: Set<string>, opts: { maxDeleteRatio?: number; force?: boolean } = {}): number {
-    const { maxDeleteRatio = 0.5, force = false } = opts
+    const { force = false } = opts
+    // Validated rather than defaulted-in-place. The ceiling below is a `>`
+    // comparison, and every comparison against NaN is false, so an unparsed
+    // ratio arriving here does not fail -- it removes the ceiling and lets the
+    // sweep through. Checked before ids() so a bad value costs no scan.
+    const maxDeleteRatio = checkNumber(opts.maxDeleteRatio, 0.5, {
+      name: 'maxDeleteRatio', min: 0, max: 1,
+    })
     const local = this.ids()
     const doomed = [...local].filter((id) => !live.has(id))
     if (doomed.length === 0) return 0

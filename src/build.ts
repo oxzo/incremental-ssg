@@ -21,6 +21,7 @@ import { createContextFactory, createRenderer, renderRoute, writeOut } from './r
 import { beginDeterministicWindow } from './determinism.ts'
 import { clearSeal, writeSeal, SEAL_SCHEMA } from './deploy.ts'
 import { statTree } from './hash-tree.ts'
+import { checkNumber } from './rails.ts'
 import type { Route, SiteConfig } from './config.ts'
 import type { AssetManifest, AssetStageResult } from './assets.ts'
 import type { Renderer } from './render.ts'
@@ -228,7 +229,16 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   }
   const assetMs = now() - ta
 
-  const workers = Math.max(1, opts.workers ?? Math.max(1, cpus().length - 2))
+  // Not Math.max(1, …): that clamp is transparent to NaN, and a NaN worker count
+  // builds a pool of zero workers, collects zero reports, agrees with itself that
+  // the site has zero routes, passes the rendered-equals-resolved check because
+  // 0 === 0, and seals an empty tree as a complete build. Every step reports
+  // success. The deploy's delete-ratio rail is the only thing standing between
+  // that seal and an unpublished site, and against an empty target there is
+  // nothing for it to refuse.
+  const workers = checkNumber(opts.workers, Math.max(1, cpus().length - 2), {
+    name: 'workers', min: 1, integer: true,
+  })
 
   const tr = now()
   let bytes = 0
