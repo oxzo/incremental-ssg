@@ -36,6 +36,20 @@ export ISSG_S3_IMAGE="docker.io/minio/minio:latest"
 export ISSG_S3_NAME="issg-minio"
 export ISSG_S3_VOLUME="issg-minio-data"
 
+# --- The webhook seam --------------------------------------------------------
+# Both ends of the trigger have to agree on these, and until now nothing defined
+# them: stack/seed.ts bakes them into the Directus flows via its own `env()`
+# fallbacks, while demo/README.md's run command passes $ISSG_HOOK_TOKEN through
+# to WEBHOOK_SECRET with no fallback at all. The result was a service that
+# refused to start -- correctly, since an empty secret is an open build trigger
+# -- against flows already provisioned with the fallback value. Defining them
+# here is what makes the two agree by construction rather than by coincidence.
+#
+# The URL is the address of the *host* as seen from inside the container, which
+# is why it is not 127.0.0.1: that would be the Directus container itself.
+export ISSG_HOOK_URL="${ISSG_HOOK_URL:-http://host.containers.internal:8787/hooks/cms}"
+export ISSG_HOOK_TOKEN="${ISSG_HOOK_TOKEN:-local-fixture-webhook-token}"
+
 # Named volumes rather than bind mounts, deliberately: rootless podman maps the
 # container's uid into a subuid range, so a host directory written by the
 # container is not owned by the host user, and SELinux relabelling is a second
