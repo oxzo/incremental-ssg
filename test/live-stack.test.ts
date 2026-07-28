@@ -136,7 +136,7 @@ describe('live stack — Directus', { skip: LIVE ? false : 'set ISSG_LIVE=1 with
 })
 
 describe('live stack — S3', { skip: LIVE ? false : 'set ISSG_LIVE=1 with stack/up.sh running' }, () => {
-  const target = () =>
+  const target = (extra: { pageSize?: number; prefix?: string } = {}) =>
     s3DeployTarget({
       bucket: process.env.ISSG_S3_BUCKET ?? 'issg-site',
       endpoint: process.env.ISSG_S3_ENDPOINT ?? 'http://127.0.0.1:9000',
@@ -144,6 +144,7 @@ describe('live stack — S3', { skip: LIVE ? false : 'set ISSG_LIVE=1 with stack
       accessKeyId: process.env.ISSG_S3_ACCESS_KEY ?? 'issglocal',
       secretAccessKey: process.env.ISSG_S3_SECRET_KEY ?? 'issglocal-fixture',
       prefix: 'live-test',
+      ...extra,
     })
 
   test('an uploaded object lists back with a digest that matches its content', async () => {
@@ -163,31 +164,40 @@ describe('live stack — S3', { skip: LIVE ? false : 'set ISSG_LIVE=1 with stack
     }
   })
 
+  /**
+   * The objects are uploaded here rather than found, because the property only
+   * exists above one page.
+   *
+   * This listed the bucket as it found it until 2026-07-28, and the bucket is
+   * empty unless a demo:live run happened to leave a site in it -- so on a fresh
+   * stack it compared two empty listings, agreed they matched, and reported that
+   * pagination against a real server works. A listing longer than the page size
+   * is the entire evidence here, and requiring it is what the old version left
+   * out.
+   */
   test('a real listing paginates past the page size and returns everything', async () => {
-    const t = s3DeployTarget({
-      bucket: process.env.ISSG_S3_BUCKET ?? 'issg-site',
-      endpoint: process.env.ISSG_S3_ENDPOINT ?? 'http://127.0.0.1:9000',
-      region: process.env.ISSG_S3_REGION ?? 'us-east-1',
-      accessKeyId: process.env.ISSG_S3_ACCESS_KEY ?? 'issglocal',
-      secretAccessKey: process.env.ISSG_S3_SECRET_KEY ?? 'issglocal-fixture',
-      pageSize: 10,
-    })
-    const small = await t.list()
-    const big = s3DeployTarget({
-      bucket: process.env.ISSG_S3_BUCKET ?? 'issg-site',
-      endpoint: process.env.ISSG_S3_ENDPOINT ?? 'http://127.0.0.1:9000',
-      region: process.env.ISSG_S3_REGION ?? 'us-east-1',
-      accessKeyId: process.env.ISSG_S3_ACCESS_KEY ?? 'issglocal',
-      secretAccessKey: process.env.ISSG_S3_SECRET_KEY ?? 'issglocal-fixture',
-      pageSize: 1000,
-    })
-    const whole = await big.list()
-    // Page size must change the request count and nothing else. If it changes
-    // the result, the continuation-token loop is wrong.
-    assert.equal(small.length, whole.length)
-    assert.deepEqual(
-      small.map((o) => o.path).sort(),
-      whole.map((o) => o.path).sort(),
-    )
+    const prefix = 'live-test/paginate'
+    const t = target({ pageSize: 10, prefix })
+    const paths = Array.from({ length: 25 }, (_, i) => `p${String(i).padStart(3, '0')}.txt`)
+    await Promise.all(paths.map((p) => t.put(p, Buffer.from(p, 'utf8'), 'text/plain')))
+    try {
+      const small = await t.list()
+      const whole = await target({ pageSize: 1000, prefix }).list()
+      // More objects than one request can return, so this listing was assembled
+      // by following MinIO's own continuation tokens rather than the fake's --
+      // including past the check that refuses a token it has already seen, which
+      // a server issuing one token per page must not trip.
+      assert.ok(small.length > 10, `paginated: ${small.length} objects at a page size of 10`)
+      assert.equal(small.length, paths.length, 'every uploaded object came back exactly once')
+      // Page size must change the request count and nothing else. If it changes
+      // the result, the continuation-token loop is wrong.
+      assert.equal(small.length, whole.length)
+      assert.deepEqual(
+        small.map((o) => o.path).sort(),
+        whole.map((o) => o.path).sort(),
+      )
+    } finally {
+      await t.remove(paths)
+    }
   })
 })
