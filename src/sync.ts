@@ -59,6 +59,19 @@ export type SyncOptions = {
   reconcile?: boolean
   /** Passed through to DocumentStore.deleteMissing. */
   maxDeleteRatio?: number
+  /**
+   * How many requests one pull may send before it is refused.
+   *
+   * A ceiling on the loop, not on the corpus. At the default page size of 500
+   * the default permits five million documents -- some 240 times the largest
+   * corpus this project has ever synced (20,461 documents, `bench/RESULTS.md`)
+   * -- so it cannot plausibly fire on a real listing, which is the property that
+   * lets it be a hard refusal rather than a warning.
+   *
+   * It scales with pageSize, since the bound is on requests: at 50 per page the
+   * same default permits half a million documents rather than five.
+   */
+  maxRequests?: number
 }
 
 export type SyncResult = {
@@ -109,6 +122,11 @@ export async function sync(
   // having pulled nothing, and the reconcile scan then sees an empty `seen` set
   // and proposes deleting the entire mirror.
   const pageSize = checkNumber(opts.pageSize, 500, { name: 'pageSize', min: 1, integer: true })
+  const maxRequests = checkNumber(opts.maxRequests, 10_000, {
+    name: 'maxRequests',
+    min: 1,
+    integer: true,
+  })
   const wantTypes = opts.contentTypes ? new Set(opts.contentTypes) : null
   const t0 = now()
 
@@ -151,6 +169,32 @@ export async function sync(
   }
 
   for (;;) {
+    // Checked before the request, and deliberately the one rail in this loop
+    // that depends on nothing else being right. `requests` counts pull requests
+    // only until the reconcile below adds to it, so at the top of the loop it is
+    // exactly how many pages this listing has asked for.
+    //
+    // Here rather than in an adapter, for the reason the duplicate-document rail
+    // is here: it then covers every adapter instead of the one that provoked it.
+    // cms-directus.ts refuses a cursor it has already sent, httpCmsAdapter
+    // refuses nothing, and the next adapter starts from whichever of those its
+    // author happened to read. A driver-level bound needs no adapter to
+    // cooperate -- and an adapter cannot supply one anyway, since the loop that
+    // would exceed it lives here.
+    //
+    // tools/mutate.py needs it from the other side, the way deploy-s3.ts does:
+    // without a bound that survives them, breaking the cursor check below hangs
+    // the harness instead of failing a test, and a hang is the one result that
+    // says nothing about which line caused it.
+    if (requests === maxRequests) {
+      throw new RailError(
+        'sync.unbounded-listing',
+        false,
+        `the CMS listing did not end within ${maxRequests} requests (${pulled} documents so far). ` +
+        `Not terminal, because this rail cannot tell a corpus that really is this large from a ` +
+        `listing that is looping, and it sits where only the second is plausible — raise ` +
+        `maxRequests if the first is what happened.`)
+    }
     const a = now()
     const page = await adapter.list({ cursor, limit: pageSize, since })
     const b = now()
@@ -250,8 +294,37 @@ export async function sync(
     // not a per-page remainder, so an adapter that learns the count in stages
     // reports its most complete answer last.
     expected = page.total
-    cursor = page.cursor
-    if (cursor === null) break
+    const next = page.cursor
+    if (next === null) break
+    // A cursor handed back unchanged asks the CMS the question it has just
+    // answered, so the next page is the page that has already been counted:
+    // `pulled` climbs, `changed` climbs with it, and the loop makes no progress
+    // it can ever finish. Presenting as a service that is busy forever and
+    // publishes nothing, which is the failure this project names as the worst
+    // available.
+    //
+    // Terminal, unlike the request cap above, and the two differ because they
+    // know different amounts. The cap sees only that a listing is long, and long
+    // is what a big corpus also looks like. This sees the CMS repeat itself,
+    // which no correct listing does at any size -- so re-running reproduces it
+    // exactly, and retrying is the loop rather than the escape from it.
+    //
+    // Only an immediate repeat, not a cycle of any length. deploy-s3.ts keeps
+    // every token it has been issued and can therefore catch a longer cycle; the
+    // difference is that this rail is not the bound. A cursor cycling with a
+    // period above one is caught by maxRequests, one refusal later and with a
+    // less precise message, which is a fair trade against holding every cursor
+    // of a five-million-document sync in memory to sharpen the wording.
+    if (next === cursor) {
+      throw new RailError(
+        'sync.stuck-cursor',
+        true,
+        `the CMS returned the same cursor it was given (${JSON.stringify(next)}) after ` +
+        `${page.items.length} document(s), so the next request would re-read the page this one ` +
+        `just returned. Refused rather than looped: an endless sync is a service that looks busy ` +
+        `and never publishes. The adapter's pagination is not advancing.`)
+    }
+    cursor = next
   }
 
   // Did the listing return everything it said it had?

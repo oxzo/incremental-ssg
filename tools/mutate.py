@@ -67,28 +67,77 @@ MUTATIONS: list[Mutation] = [
         "a blank doc_id collapses every such document onto one store row",
         "test/cms-directus.test.ts",
     ),
+    # --- the retry policy, now shared by both adapters -------------------------
+    #
+    # These used to live in cms-directus.ts, which is where the policy was.
+    # httpCmsAdapter -- the adapter every non-Directus CMS starts from -- had a
+    # bare fetch and a plain Error, so the choice was a second copy of the loop
+    # or one implementation with two callers.
+    #
+    # The first two stay anchored on the directus tests, which are the ones that
+    # have always killed them. test/cms-http.test.ts now reaches the same lines
+    # from the other caller, and cms-no-request-deadline is the one only it can
+    # fail: the Directus adapter has had a deadline since it was written, so
+    # nothing over there was ever written to notice its absence.
     Mutation(
         "cms-retry-after-uncapped",
-        "src/cms-directus.ts",
-        "? Math.min(Math.max(wait, 0), maxRetryAfterMs)",
+        "src/http-retry.ts",
+        "? Math.min(Math.max(wait, 0), policy.maxRetryAfterMs)",
         "? Math.max(wait, 0)",
         "an upstream Retry-After of an hour stalls publishing for an hour",
         "test/cms-directus.test.ts",
     ),
     Mutation(
         "cms-4xx-retried",
-        "src/cms-directus.ts",
-        "throw new RailError('cms.request', true, `${res.status} ${res.statusText} on ${path}: ${detail}`)",
-        "throw new RailError('cms.request', false, `${res.status} ${res.statusText} on ${path}: ${detail}`)",
+        "src/http-retry.ts",
+        "throw new RailError(rail, true, `${res.status} ${res.statusText} on ${label}: ${detail}`)",
+        "throw new RailError(rail, false, `${res.status} ${res.statusText} on ${label}: ${detail}`)",
         "retrying a 403 is a loop that looks busy and never publishes",
         "test/cms-directus.test.ts",
     ),
     Mutation(
+        "cms-no-request-deadline",
+        "src/http-retry.ts",
+        "      res = await send(AbortSignal.timeout(policy.timeoutMs))",
+        "      res = await send(new AbortController().signal)",
+        "a socket that opens and goes quiet never returns and never throws, so no retry loop can see it",
+        "test/cms-http.test.ts",
+    ),
+    # The login endpoint's classification, in both directions.
+    #
+    # It used to be one bit for every non-2xx -- `terminal: true` -- which is the
+    # right answer to wrong credentials and the wrong answer to a restart. Both
+    # halves are mutated because getting this backwards is silent either way
+    # (src/rails.ts:26): retried credentials look busy and never publish, and a
+    # terminal 503 halts a service the CMS has already come back for.
+    Mutation(
         "cms-bad-credentials-retried",
         "src/cms-directus.ts",
-        "throw new RailError('cms.auth', true, `login failed: ${res.status} ${res.statusText}`)",
-        "throw new RailError('cms.auth', false, `login failed: ${res.status} ${res.statusText}`)",
+        "      const badCredentials = res.status === 401 || res.status === 403",
+        "      const badCredentials = false",
         "wrong credentials do not improve with retrying",
+        "test/cms-directus.test.ts",
+    ),
+    Mutation(
+        "cms-login-outage-terminal",
+        "src/cms-directus.ts",
+        "      const badCredentials = res.status === 401 || res.status === 403",
+        "      const badCredentials = true",
+        "a Directus restart answers 503 on /auth/login, and halting on it stops publishing until a human clears it",
+        "test/cms-directus.test.ts",
+    ),
+    # In http-retry.ts rather than in the adapter, because that is where the
+    # decision now is: `send` does the lazy login, so honouring a *transient*
+    # throw from it is what gives a login the attempt budget at all. Restoring
+    # the old behaviour is one line -- rethrow whatever came out -- and it puts
+    # the request most likely to meet a restarting CMS back on the path with no
+    # retry.
+    Mutation(
+        "cms-login-not-retried",
+        "src/http-retry.ts",
+        "      if (isTerminal(e)) throw e\n      lastError = e\n      continue",
+        "      throw e",
+        "a login failure that escapes the attempt loop gets one try, no backoff, and none of the wait budget",
         "test/cms-directus.test.ts",
     ),
     Mutation(
@@ -117,9 +166,9 @@ MUTATIONS: list[Mutation] = [
     ),
     Mutation(
         "cms-no-retry",
-        "src/cms-directus.ts",
-        "const attempts = Math.max(1, opts.attempts ?? 4)",
-        "const attempts = 1",
+        "src/http-retry.ts",
+        "    attempts: checkNumber(o.attempts, 4, { name: 'attempts', min: 1, integer: true }),",
+        "    attempts: 1,",
         "a single transient 500 fails the whole sync",
         "test/cms-directus.test.ts",
     ),
@@ -666,6 +715,55 @@ MUTATIONS: list[Mutation] = [
         "        if (Number.isFinite(count) && out.length < count) {",
         "rows with an unusable doc_id are dropped on purpose, so counting kept ids refuses a listing that was complete",
         "test/cms-directus.test.ts",
+    ),
+    # --- the pull loop, and what makes it stop --------------------------------
+    #
+    # `for (;;)` with `requests` counted for reporting only: the sole thing that
+    # ended a sync was the CMS choosing to return a null cursor. Measured against
+    # an adapter handing back a constant cursor -- 50,001 requests and still
+    # climbing at the bail-out, with nothing thrown and nothing logged. The
+    # asymmetry is what makes it a finding rather than a preference: deploy-s3.ts
+    # has had maxListRequests and two mutations for the same shape, and sync had
+    # neither.
+    Mutation(
+        "sync-listing-unbounded",
+        "src/sync.ts",
+        "    if (requests === maxRequests) {",
+        "    if (false) {",
+        "the only bound in the pull loop that does not depend on the cursor check being right",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-stuck-cursor-followed",
+        "src/sync.ts",
+        "    if (next === cursor) {",
+        "    if (false) {",
+        "a cursor returned unchanged re-reads the page just returned, forever, and only the request cap is left to notice",
+        "test/sync.test.ts",
+    ),
+    # The classification, not the check -- the same pairing deploy.listing gets.
+    # A repeat is a fact about the CMS and reproduces on every run; marking it
+    # transient hands it to the service's backoff, which retries a sync that
+    # cannot terminate until the cap fires, every time, forever.
+    Mutation(
+        "sync-stuck-cursor-transient",
+        "src/sync.ts",
+        "        'sync.stuck-cursor',\n        true,",
+        "        'sync.stuck-cursor',\n        false,",
+        "retrying a CMS that repeats its cursor is the loop rather than the escape from it",
+        "test/sync.test.ts",
+    ),
+    Mutation(
+        "sync-max-requests-unchecked",
+        "src/sync.ts",
+        "  const maxRequests = checkNumber(opts.maxRequests, 10_000, {\n"
+        "    name: 'maxRequests',\n"
+        "    min: 1,\n"
+        "    integer: true,\n"
+        "  })",
+        "  const maxRequests = opts.maxRequests ?? 10_000",
+        "a cap that failed to parse is NaN, and `requests === NaN` is false at every request",
+        "test/numeric-guards.test.ts",
     ),
     # --- draining a pool before reporting that it failed ----------------------
     #

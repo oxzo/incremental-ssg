@@ -16,6 +16,8 @@
 //   webhookRevisions needs a two-operation flow provisioned in Directus, and
 //                    only creates and updates can carry a revision at all.
 import { RailError } from './rails.ts'
+import { requestWithRetry, retryPolicy } from './http-retry.ts'
+import type { RetryOptions } from './http-retry.ts'
 import type { CmsAdapter, CmsDocument, CmsPage, ListOptions } from './cms.ts'
 
 export type DirectusCollection = {
@@ -25,7 +27,7 @@ export type DirectusCollection = {
   type?: string
 }
 
-export type DirectusOptions = {
+export type DirectusOptions = RetryOptions & {
   baseUrl: string
   /** A static access token. Preferred: no login round-trip, no expiry mid-sync. */
   token?: string
@@ -35,19 +37,6 @@ export type DirectusOptions = {
   /** Collections to sync, in a fixed order. Pagination walks them in this order. */
   collections: (string | DirectusCollection)[]
   name?: string
-  /** Per-request timeout. A hung socket is the failure a retry loop cannot see. */
-  timeoutMs?: number
-  /** Attempts per request, including the first. */
-  attempts?: number
-  /** First backoff step; doubles per attempt. */
-  backoffMs?: number
-  /** Cap on a server-supplied Retry-After, so a hostile header cannot wedge sync. */
-  maxRetryAfterMs?: number
-  /**
-   * Budget for total time spent waiting between attempts of one request. Caps by
-   * accumulation what maxRetryAfterMs caps per attempt.
-   */
-  maxTotalWaitMs?: number
 }
 
 /**
@@ -83,10 +72,7 @@ function parseCursor(cursor: string | null): { index: number; seq: number } {
 
 export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
   const base = opts.baseUrl.replace(/\/$/, '')
-  const timeoutMs = opts.timeoutMs ?? 15_000
-  const attempts = Math.max(1, opts.attempts ?? 4)
-  const backoffMs = opts.backoffMs ?? 250
-  const maxRetryAfterMs = opts.maxRetryAfterMs ?? 30_000
+  const policy = retryPolicy(opts)
   const cols: DirectusCollection[] = opts.collections.map((c) =>
     typeof c === 'string' ? { collection: c, type: c } : { collection: c.collection, type: c.type ?? c.collection },
   )
@@ -98,19 +84,47 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
   let bytes = 0
   let token = opts.token ?? ''
 
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-
+  /**
+   * Exchange credentials for a token, and classify the ways that can fail.
+   *
+   * The classification is the whole of this function's risk, and it used to be a
+   * single bit for every non-2xx: `terminal: true`, on the argument that wrong
+   * credentials do not improve with retrying. True, and it answers only one of
+   * the reasons a login endpoint says no. A Directus restart answers 503 for the
+   * seconds it takes to come back, a reverse proxy in front of it answers 502,
+   * and a rate limiter answers 429 -- all of which the *rest* of this adapter
+   * already treats as facts about right now. Under `serve`, a terminal refusal
+   * halts the service and only a human or an explicit force moves it: measured
+   * against a server answering 503 on /auth/login, `rail: cms.auth | terminal:
+   * true`, which is a restart during a poll turning into publishing that never
+   * resumes.
+   *
+   * So the bit is decided by what the status says, matching request() below:
+   * 401 and 403 are facts about the credentials, everything else is a fact about
+   * the moment. A network error or a timeout throws before this line and is not
+   * a RailError at all, which `isTerminal` already reads as transient.
+   *
+   * Retrying is the caller's, not this function's. request() owns the attempt
+   * budget and the total-wait budget, and a second retry loop here would nest
+   * inside those and multiply them.
+   */
   async function login(): Promise<void> {
     const res = await fetch(`${base}/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email: opts.email, password: opts.password }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(policy.timeoutMs),
     })
     if (!res.ok) {
       // Wrong credentials do not improve with retrying, and a service that keeps
-      // trying them looks busy while publishing nothing.
-      throw new RailError('cms.auth', true, `login failed: ${res.status} ${res.statusText}`)
+      // trying them looks busy while publishing nothing. Everything else does
+      // improve with retrying, and a service that refuses to try looks halted
+      // while the CMS is already back.
+      const badCredentials = res.status === 401 || res.status === 403
+      throw new RailError(
+        'cms.auth',
+        badCredentials,
+        `login failed: ${res.status} ${res.statusText}`)
     }
     // The shape is stated rather than assumed. res.json() is `unknown`, and
     // reaching through it unchecked is how a login that succeeds with an
@@ -122,102 +136,54 @@ export function directusCmsAdapter(opts: DirectusOptions): CmsAdapter {
   }
 
   /**
-   * One request, with the retry policy the mock never needed.
+   * One request, authorised, with the retry policy applied.
    *
-   * The classification is the load-bearing part, not the backoff. A 429 or a 5xx
-   * is a fact about right now and retrying is the correct response; a 403 or a
-   * 404 is a fact about the request and retrying it is a loop. Anything
-   * unrecognised is treated as transient, matching `isTerminal`'s default -- an
-   * unclassified failure is usually a blip, and the service's consecutive-failure
-   * count is what stops a genuinely broken sync from retrying forever.
+   * The policy itself is in src/http-retry.ts, not here, and the move is the
+   * point rather than tidiness: httpCmsAdapter had none of it -- no timeout, no
+   * attempts, and a plain Error for every non-ok status -- and the fix for that
+   * was either a second copy of this loop or one implementation with two
+   * callers. This codebase has met the first option twice, in pool() and in the
+   * two spellings of isInside(), and both times the copies stayed identical
+   * exactly until one of them was fixed.
+   *
+   * What stays here is what is actually Directus's: the bearer token, and the
+   * rule that exactly one re-login can clear a 401. An expired token is not an
+   * authorisation failure, it is a stale one, and only this closure knows
+   * whether it has already spent its one re-login -- answering yes every time
+   * would turn genuinely bad credentials into an infinite loop.
    */
   async function request(path: string): Promise<any> {
-    if (token === '') await login()
     let reauthed = false
-    let lastError: unknown = null
-
-    /**
-     * A budget for time spent *waiting*, separate from the per-request timeout.
-     *
-     * The per-attempt cap on Retry-After stops one hostile header from stalling
-     * publishing; this stops the same thing happening by accumulation, which no
-     * per-attempt cap can see. Both matter, and the failure they prevent is the
-     * one this project keeps naming as the worst available: a service that is
-     * busy forever and publishes nothing, with nobody watching.
-     *
-     * It also makes the waits *bounded* rather than merely capped, which is what
-     * lets a test observe the behaviour instead of waiting out the header.
-     */
-    const waitDeadline = performance.now() + (opts.maxTotalWaitMs ?? 60_000)
-    const waitFor = async (ms: number) => {
-      const left = waitDeadline - performance.now()
-      if (ms > left) {
-        throw new RailError(
-          'cms.request',
-          false,
-          `${path}: retry budget exhausted — next wait of ${Math.round(ms)}ms exceeds the ${Math.round(Math.max(left, 0))}ms left`,
-        )
-      }
-      await sleep(ms)
-    }
-
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      if (attempt > 0) await waitFor(backoffMs * 2 ** (attempt - 1))
-      let res: Response
-      try {
-        res = await fetch(`${base}${path}`, {
-          headers: { authorization: `Bearer ${token}` },
-          signal: AbortSignal.timeout(timeoutMs),
-        })
-      } catch (e) {
-        // Includes the abort. A timeout is retryable by construction: the point
-        // of the deadline is that a hung socket never returns a status at all.
-        lastError = e
-        continue
-      }
-
-      if (res.ok) {
-        const text = await res.text()
-        bytes += Buffer.byteLength(text)
-        return JSON.parse(text)
-      }
-
-      // An expired token is not an authorisation failure, it is a stale one, and
-      // the difference is that exactly one re-login can fix it. Re-logging in on
-      // every 401 would turn genuinely bad credentials into an infinite loop.
-      if (res.status === 401 && !reauthed) {
-        reauthed = true
-        await login()
-        continue
-      }
-
-      if (res.status === 429) {
-        // Honoured, but capped: an upstream that says "come back in an hour" must
-        // not be able to stall publishing for an hour on its own say-so.
-        const header = res.headers.get('retry-after')
-        const wait = header === null ? null : Number(header) * 1000
-        const delay = wait !== null && Number.isFinite(wait)
-          ? Math.min(Math.max(wait, 0), maxRetryAfterMs)
-          : backoffMs * 2 ** attempt
-        lastError = new Error(`429 rate limited on ${path}`)
-        await waitFor(delay)
-        continue
-      }
-
-      if (res.status >= 500) {
-        lastError = new Error(`${res.status} ${res.statusText} on ${path}`)
-        continue
-      }
-
-      const detail = (await res.text()).slice(0, 300)
-      throw new RailError('cms.request', true, `${res.status} ${res.statusText} on ${path}: ${detail}`)
-    }
-
-    throw new RailError(
+    const text = await requestWithRetry(
       'cms.request',
-      false,
-      `${path} failed after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+      path,
+      policy,
+      async (signal) => {
+        // Inside the attempt rather than ahead of the loop, which is what makes
+        // login()'s transient classification mean anything: a login that met a
+        // restarting CMS used to get one try, no backoff, and none of the wait
+        // budget. requestWithRetry honours a terminal RailError from here, so
+        // credentials that are wrong still leave on the first attempt.
+        if (token === '') await login()
+        return await fetch(`${base}${path}`, {
+          headers: { authorization: `Bearer ${token}` },
+          signal,
+        })
+      },
+      {
+        onUnauthorized: () => {
+          if (reauthed) return false
+          reauthed = true
+          // Cleared rather than re-logged-in here, so the re-login happens in
+          // the next attempt's send() and inherits its classification and its
+          // place in the budget.
+          token = ''
+          return true
+        },
+      },
     )
+    bytes += Buffer.byteLength(text)
+    return JSON.parse(text)
   }
 
   /**

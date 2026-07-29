@@ -12,6 +12,8 @@
 // A CMS missing all three does not need a different adapter so much as a
 // different cost model, which is why `capabilities` is data the sync driver
 // branches on rather than something each adapter silently works around.
+import { requestWithRetry, retryPolicy } from './http-retry.ts'
+import type { RetryOptions } from './http-retry.ts'
 
 export type CmsDocument = {
   id: string
@@ -86,7 +88,7 @@ export type CmsAdapter = {
   bytesRead(): number
 }
 
-export type HttpCmsOptions = {
+export type HttpCmsOptions = RetryOptions & {
   baseUrl: string
   name?: string
   capabilities?: Partial<CmsCapabilities>
@@ -105,12 +107,40 @@ export type HttpCmsOptions = {
 export function httpCmsAdapter(opts: HttpCmsOptions): CmsAdapter {
   const base = opts.baseUrl.replace(/\/$/, '')
   const headers = opts.headers ?? {}
+  const policy = retryPolicy(opts)
   let bytes = 0
 
+  /**
+   * One listing request, on the same terms cms-directus.ts already used.
+   *
+   * This was `await fetch(url, { headers })` with a plain `Error` on any non-ok
+   * status, and each half of that is a defect the other adapter had already
+   * fixed:
+   *
+   *   - No deadline. `fetch` has no default timeout, so a socket that opens and
+   *     then goes quiet never returns and never throws. Under `serve` that is
+   *     the build lock held, `consecutiveFailures` at 0, `/health` answering
+   *     200, and the site quietly stale -- the failure this project names as the
+   *     worst available, and the one a retry loop cannot see because there is
+   *     nothing to retry.
+   *   - No classification. A plain Error is not a RailError, and `isTerminal`
+   *     reads anything else as transient by design, so a permanent 403 on the
+   *     documents endpoint was retried by the service forever on a widening
+   *     backoff. The default is right for an unrecognised failure and wrong for
+   *     one the status has already named.
+   *
+   * No `onUnauthorized` hook: this adapter carries whatever headers it was given
+   * and has no token to refresh, so a 401 here is a fact about the credentials
+   * rather than about their age, and the terminal 4xx path is the correct answer
+   * to it.
+   */
   const getJson = async (url: string) => {
-    const res = await fetch(url, { headers })
-    if (!res.ok) throw new Error(`CMS ${res.status} ${res.statusText} for ${url}`)
-    const text = await res.text()
+    const text = await requestWithRetry(
+      'cms.request',
+      url,
+      policy,
+      (signal) => fetch(url, { headers, signal }),
+    )
     bytes += Buffer.byteLength(text)
     return JSON.parse(text)
   }

@@ -324,6 +324,63 @@ describe('directus adapter — resilience', () => {
       () => adapter.list({ cursor: null, limit: 10 }),
       (e: unknown) => e instanceof RailError && e.terminal,
     )
+    // One attempt, not four. The point of the terminal bit is that the attempts
+    // it saves were always going to fail.
+    assert.equal(fake.requests().filter((r) => r.path === '/auth/login').length, 1)
+  })
+
+  // The login endpoint, classified the way every other endpoint here already is.
+  //
+  // `login()` threw `terminal: true` on every non-2xx, on the argument that wrong
+  // credentials do not improve with retrying -- true, and an answer to only one
+  // of the reasons a login says no. Measured against a server answering 503 on
+  // /auth/login: `rail: cms.auth | terminal: true`. Under `serve` that is a
+  // Directus restart during a poll halting publishing until a human clears it,
+  // while every *other* request in this adapter would have retried the same
+  // outage and recovered.
+  test('retries a login that failed with a 5xx, and publishes once it comes back', async () => {
+    const fake = track(await startFakeDirectus(fakeRows({ post: 2 }), { failLoginWith: [503] }))
+    const adapter = adapterFor(fake.url, ['post'], { backoffMs: 5 })
+    const { ids } = await drain(adapter, 100)
+    assert.deepEqual(ids, ['post-0', 'post-1'])
+    // Two logins: the one that met the restart, and the one that did not.
+    assert.equal(fake.requests().filter((r) => r.path === '/auth/login').length, 2)
+  })
+
+  test('a 502 from a proxy in front of the login is transient too', async () => {
+    // Not the same status and not the same cause, which is the point: the rule
+    // is "401 and 403 are about the credentials, everything else is about the
+    // moment" rather than a list of blessed statuses.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 1 }), { failLoginWith: [502, 502] }))
+    const adapter = adapterFor(fake.url, ['post'], { backoffMs: 5 })
+    const { ids } = await drain(adapter, 100)
+    assert.deepEqual(ids, ['post-0'])
+  })
+
+  test('a login that stays down gives up non-terminally, so the service retries', async () => {
+    const fake = track(await startFakeDirectus(
+      fakeRows({ post: 1 }),
+      { failLoginWith: [503, 503, 503, 503, 503, 503] },
+    ))
+    const adapter = adapterFor(fake.url, ['post'], { backoffMs: 1, attempts: 3 })
+    await assert.rejects(
+      () => adapter.list({ cursor: null, limit: 10 }),
+      // Non-terminal: the CMS being down is a fact about right now. What stops
+      // an endless retry is the service's consecutive-failure count, not a bit
+      // set here -- the same division the 500 path above already makes.
+      (e: unknown) => e instanceof RailError && !e.terminal,
+    )
+    assert.equal(fake.requests().filter((r) => r.path === '/auth/login').length, 3)
+  })
+
+  test('a 403 on the login stays terminal, because the token would not be granted', async () => {
+    const fake = track(await startFakeDirectus(fakeRows({ post: 1 }), { failLoginWith: [403] }))
+    const adapter = adapterFor(fake.url, ['post'], { backoffMs: 1 })
+    await assert.rejects(
+      () => adapter.list({ cursor: null, limit: 10 }),
+      (e: unknown) => e instanceof RailError && e.terminal && e.rail === 'cms.auth',
+    )
+    assert.equal(fake.requests().filter((r) => r.path === '/auth/login').length, 1)
   })
 
   test('a 403 is terminal, because retrying a permission failure is a loop', async () => {

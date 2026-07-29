@@ -74,10 +74,22 @@ export async function startFakeDirectus(
      * truncation detectable and what makes it silent without a check.
      */
     queryLimitMax?: number
+    /**
+     * Answer the first login attempts with these statuses, then behave normally.
+     *
+     * The failure a healthy Directus will not produce on demand, and the one the
+     * adapter's classification turns on: a restart answers 503 on /auth/login
+     * for the seconds it takes to come back, a proxy in front of it answers 502,
+     * and neither is a statement about the credentials. A list rather than a
+     * count, so a test can say *which* status it means -- 403 has to stay
+     * terminal while 503 does not.
+     */
+    failLoginWith?: number[]
   } = {},
 ): Promise<FakeDirectus> {
   const token = opts.token ?? 'fake-token'
   const seen: { path: string; query: Record<string, string> }[] = []
+  const loginFailures = [...(opts.failLoginWith ?? [])]
 
   const server: Server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://fake')
@@ -88,6 +100,10 @@ export async function startFakeDirectus(
       const chunks: Buffer[] = []
       for await (const c of req) chunks.push(c as Buffer)
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      // Ahead of the credential check, because the injected statuses stand for a
+      // server that is not in a position to read the credentials at all.
+      const injected = loginFailures.shift()
+      if (injected !== undefined) return json(res, injected, { errors: [{ message: 'injected' }] })
       if (body.password === 'wrong') return json(res, 401, { errors: [{ message: 'bad credentials' }] })
       return json(res, 200, { data: { access_token: token } })
     }

@@ -687,6 +687,143 @@ describe('sync — a listing that came back short', () => {
 
 })
 
+// A listing that never ends.
+//
+// The driver's pull loop was `for (;;)` with `requests` counted for reporting
+// only, so the sole thing that stopped it was the CMS choosing to hand back a
+// null cursor. Measured before this existed, against an adapter returning a
+// constant cursor and a fresh id per page: 50,001 requests and still climbing at
+// the bail-out. Nothing threw, nothing logged, and under the service that is the
+// build lock held, consecutiveFailures at 0, /health answering 200, and the site
+// quietly stale -- the failure src/rails.ts names as the worst available.
+//
+// Two rails, and they are not redundant. The cursor check knows the CMS repeated
+// itself and can be terminal; the request cap knows only that a listing is long,
+// which is also what a large corpus looks like, so it is transient and it is the
+// one that holds when the other is wrong.
+describe('sync — a listing that never ends', () => {
+  /**
+   * An adapter whose pagination is broken in one of two ways.
+   *
+   * A fake rather than the mock HTTP server, for the reason the counting adapter
+   * above is one: the rails read `CmsPage.cursor`, which is an adapter-contract
+   * value, and driving it over HTTP would test the http adapter's cursor parsing
+   * on the way to testing the driver.
+   *
+   * Every page carries a *fresh* id, so the duplicate-document rail cannot fire
+   * and take the credit -- that was the shape the original repro needed to prove
+   * the loop was genuinely unbounded rather than caught by something else.
+   */
+  const endless = () => {
+    let calls = 0
+    return {
+      name: 'endless',
+      capabilities: { deltaSync: false, idListing: false, webhookRevisions: false },
+      calls: () => calls,
+      async list() {
+        calls++
+        return {
+          items: [{
+            id: `d${calls}`,
+            type: 'post',
+            revision: `r${calls}`,
+            updatedAt: EPOCH,
+            doc: { id: `d${calls}` },
+          }],
+          cursor: 'always-the-same',
+        }
+      },
+      async listIds() {
+        return []
+      },
+      revisionOf: () => null,
+      bytesRead: () => 0,
+    }
+  }
+
+  test('a cursor handed back unchanged is refused, terminally', async () => {
+    const store = new DocumentStore(fresh())
+    const adapter = endless()
+    try {
+      // maxRequests is set here for the harness rather than for the assertion.
+      // Removing the refusal below leaves this adapter looping, and the default
+      // cap of 10,000 would catch it eventually -- correctly, but after ten
+      // thousand upserts. A low cap keeps the mutation's failure quick, and it
+      // is still the wrong rail firing, which is what fails the matcher.
+      await assert.rejects(
+        () => sync(adapter, store, { pageSize: 500, maxRequests: 50 }),
+        (e: Error) => {
+          assert.match(e.message, /returned the same cursor it was given/)
+          assert.equal((e as { rail?: string }).rail, 'sync.stuck-cursor')
+          // Terminal: a CMS repeating itself does so again on the next run, so a
+          // retry is the loop rather than the escape from it.
+          assert.equal((e as { terminal?: boolean }).terminal, true)
+          return true
+        })
+      // Two requests, not ten thousand. Proves the cursor check fired and not
+      // the cap -- without this the test would pass on the cap alone and the
+      // terminal classification above would be the only thing distinguishing
+      // them.
+      assert.equal(adapter.calls(), 2)
+    } finally {
+      store.close()
+    }
+  })
+
+  /**
+   * The bound that holds when the cursor check does not.
+   *
+   * Driven by an *honest* CMS with the cap set below what its listing needs,
+   * rather than by a genuinely endless one. A cursor that advances forever is
+   * the failure this rail is for, but a test built on one can only fail by
+   * running forever: remove the cap and the mutation outlives the test, the run
+   * hangs, and tools/mutate.py reads a hang as no result. deploy-s3.test.ts made
+   * this same trade for the same reason, and it is why the assertion below is
+   * about where the loop stopped rather than about a loop that cannot stop.
+   */
+  test('refuses a listing that outruns the request cap instead of following it forever', async () => {
+    const h = await harness(blogDocs({ posts: 10 }))
+    try {
+      await assert.rejects(
+        () => sync(h.adapter, h.store, { pageSize: 2, maxRequests: 5 }),
+        (e: Error) => {
+          assert.match(e.message, /did not end within 5 requests/)
+          assert.equal((e as { rail?: string }).rail, 'sync.unbounded-listing')
+          // Transient: this rail cannot tell a corpus that really is this large
+          // from a listing that is looping.
+          assert.equal((e as { terminal?: boolean }).terminal, false)
+          return true
+        })
+      // Checked before the request, so the cap is how many were sent rather than
+      // how many were sent plus one: ten documents, from five pages of two, and
+      // the sixth request is the one that was refused rather than made.
+      assert.equal(h.store.count(), 10)
+    } finally {
+      await h.close()
+    }
+  })
+
+  test('a listing that ends inside the cap is not refused', async () => {
+    // The negative control. A rail that refused every multi-page pull would pass
+    // both tests above.
+    const docs = blogDocs({ posts: 10 })
+    const h = await harness(docs)
+    try {
+      const r = await sync(h.adapter, h.store, { pageSize: 5, maxRequests: 25 })
+      // Several pages, so the loop really does iterate -- a page size large
+      // enough to finish in one request would exercise neither rail.
+      assert.ok(r.requests > 2 && r.requests < 25, `requests was ${r.requests}`)
+      assert.equal(r.pulled, docs.length)
+    } finally {
+      await h.close()
+    }
+  })
+
+  // The NaN case lives in test/numeric-guards.test.ts with the rest of them --
+  // an unparsed maxRequests is the A2 shape rather than a listing failure, and
+  // the two are worth reading together.
+})
+
 // Two collections, one id. The mirror was keyed by id alone until this, and a
 // multi-collection CMS puts no constraint across collections.
 describe('sync — documents are identified by (type, id)', () => {

@@ -240,6 +240,50 @@ describe('counts that failed to parse', () => {
       await cms.close()
     }
   })
+
+  test('sync refuses NaN maxRequests, which would leave the pull loop unbounded', async () => {
+    // The cap is `requests === maxRequests`, so a NaN one is a comparison that
+    // is false at every request -- the rail is present, reads correctly, and
+    // never fires. Checked before the first request rather than discovered at
+    // the ten-thousandth, so the adapter below is never reached.
+    let calls = 0
+    // Ten pages, not infinitely many, and the cap below is set under that. A
+    // genuinely endless adapter would make the control hang rather than fail
+    // when tools/mutate.py removes the cap, and a hang reports nothing about
+    // which line caused it -- the same trade test/deploy-s3.test.ts makes for
+    // its request cap.
+    const longListing = {
+      name: 'long',
+      capabilities: { deltaSync: false, idListing: false, webhookRevisions: false },
+      async list() {
+        calls++
+        return { items: [], cursor: calls < 10 ? `page-${calls}` : null }
+      },
+      async listIds() { return [] },
+      revisionOf: () => null,
+      bytesRead: () => 0,
+    }
+    const dbPath = join(work('numeric-sync-cap'), 'content.db')
+    const store = new DocumentStore(dbPath)
+    try {
+      await assert.rejects(
+        () => sync(longListing, store, { maxRequests: Number('lots') }),
+        (e: unknown) => {
+          assert.equal((e as RailError).rail, 'invalid-number')
+          assert.match((e as Error).message, /maxRequests/)
+          return true
+        })
+      assert.equal(calls, 0)
+      // Control: the same adapter under a usable cap is refused by the listing
+      // rail instead, which is the rail that was supposed to answer for it.
+      await assert.rejects(
+        () => sync(longListing, store, { maxRequests: 3 }),
+        (e: unknown) => (e as RailError).rail === 'sync.unbounded-listing')
+      assert.equal(calls, 3)
+    } finally {
+      store.close()
+    }
+  })
 })
 
 describe('the CLI rejects unusable numbers before doing any work', () => {
