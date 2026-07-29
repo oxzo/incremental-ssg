@@ -3,15 +3,17 @@ import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { join, resolve } from 'node:path'
 import { createService, createPipeline, silentLog, DIRTY_KEY } from '../src/service.ts'
+import { existsSync, writeFileSync } from 'node:fs'
 import { DocumentStore } from '../src/store.ts'
 import { SYNC_MUTATING } from '../src/sync.ts'
 import { RailError } from '../src/rails.ts'
 import { acquireLock } from '../src/build-lock.ts'
+import { ACCEPTED_FILE } from '../src/accepted.ts'
 import { startMockCms } from '../src/cms-mock.ts'
 import { httpCmsAdapter } from '../src/cms.ts'
 import { directoryTarget } from '../src/deploy-mock.ts'
 import { tmpdir, cleanup, blogDocs } from './fixture.ts'
-import type { RunReport, Trigger, Pipeline } from '../src/service.ts'
+import type { RunReport, Trigger, Pipeline, Service } from '../src/service.ts'
 import type { MockDoc } from '../src/cms-mock.ts'
 import type { CmsCapabilities } from '../src/cms.ts'
 
@@ -612,7 +614,7 @@ describe('service — stopping settles what it accepted', () => {
       run: async (t: Trigger) => {
         runs.push(t)
         await gate
-        return {} as RunReport
+        return ok(t)
       },
       debounceMs: 1,
       pollMs: 0,
@@ -633,5 +635,172 @@ describe('service — stopping settles what it accepted', () => {
     ])
     assert.equal(service.status().pending, false)
     assert.equal(d.length > 0, true)
+  })
+})
+
+// The durable half of a 202. Until this existed, `{ queued: true }` was a claim
+// about a variable in memory.
+describe('service — an acknowledged trigger survives a restart', () => {
+  const fire = (o: Partial<Trigger> = {}): Trigger =>
+    ({ source: 'webhook', expectations: [], force: false, ...o })
+
+  /**
+   * A service whose run blocks until released, so a trigger can be observed
+   * mid-flight -- driven through a callback so the gate is *always* released and
+   * the service always stopped, including when an assertion throws.
+   *
+   * Written this way because the first draft was not, and a failing assertion
+   * left a run blocked on a gate nobody would ever open: the file stopped
+   * exiting, and a detected defect presented as a hang. That is the exact shape
+   * A5 already found in sync.test.ts, reproduced here by hand.
+   */
+  async function withGated(
+    dir: string,
+    body: (g: { service: Service; seen: Trigger[]; release: () => void }) => Promise<void>,
+    opts: Record<string, unknown> = {},
+  ) {
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const seen: Trigger[] = []
+    const service = createService({
+      run: async (t: Trigger) => {
+        seen.push(t)
+        await gate
+        // ok(t), not `{} as RunReport`. The service reads
+        // report.readAfterWrite.outstanding on the success path, so an empty
+        // stub makes every run throw, schedule a retry, and leave the service
+        // un-quiet -- which presents as idle() hanging rather than as a failure.
+        return ok(t)
+      },
+      lockDir: dir,
+      debounceMs: 1,
+      pollMs: 0,
+      log: silentLog,
+      ...opts,
+    })
+    try {
+      await body({ service, seen, release: () => release() })
+    } finally {
+      release()
+      await service.stop()
+    }
+  }
+
+  const marker = (d: string) => existsSync(join(d, ACCEPTED_FILE))
+
+  test('the marker exists before the run does, not because of it', async () => {
+    // Written inside notify(), synchronously, so webhook.ts cannot answer 202
+    // before the record is on disk.
+    const d = work('accepted-at-ack')
+    await withGated(d, async (g) => {
+      g.service.start()
+      assert.equal(marker(d), false, 'a startup trigger is not an acknowledgement')
+      g.service.notify(fire())
+      assert.equal(marker(d), true, 'the marker must exist the moment notify() returns')
+    })
+  })
+
+  test('a completed run discharges it', async () => {
+    const d = work('accepted-cleared')
+    await withGated(d, async (g) => {
+      g.service.start()
+      g.service.notify(fire())
+      assert.equal(marker(d), true)
+      g.release()
+      await g.service.idle()
+      assert.equal(marker(d), false, 'a served trigger must not be replayed forever')
+    })
+  })
+
+  test('a failed run leaves it, because what it acknowledged has not happened', async () => {
+    const d = work('accepted-failed')
+    const service = createService({
+      run: async () => { throw new Error('deploy blew up') },
+      lockDir: d,
+      debounceMs: 1,
+      pollMs: 0,
+      retryMs: 60_000, // long enough that the retry cannot fire during the test
+      log: silentLog,
+    })
+    try {
+      service.start()
+      service.notify(fire())
+      await new Promise((r) => setTimeout(r, 80))
+      assert.equal(marker(d), true)
+    } finally {
+      await service.stop()
+    }
+  })
+
+  test('stopping leaves it, which is what makes dropping in-memory pending safe', async () => {
+    const d = work('accepted-stop')
+    const service = createService({
+      run: () => new Promise<RunReport>(() => {}), // never settles: the process dies here
+      lockDir: d,
+      debounceMs: 1,
+      pollMs: 0,
+      log: silentLog,
+    })
+    service.start()
+    service.notify(fire())
+    assert.equal(marker(d), true)
+    // No stop() -- a stop would await the run that never settles, which is the
+    // point: this models a process that went away. The marker is what is left.
+    assert.equal(marker(d), true)
+  })
+
+  test('a poll never writes it', async () => {
+    // The negative control, guarding a specific regression: a poll marking here
+    // would leave the marker permanently set on an idle site, so every restart
+    // would force a publish and the skip rule would be unreachable -- the same
+    // liveness cost this plan rejected the reviewed A1 fix for.
+    const d = work('accepted-poll')
+    await withGated(d, async (g) => {
+      g.service.start()
+      g.service.notify({ source: 'poll', expectations: [], force: false })
+      assert.equal(marker(d), false)
+    })
+  })
+
+  test('a forced trigger comes back forced, which is the case that was lost', async () => {
+    // The point of the mechanism. A forced trigger's justification is not in the
+    // CMS -- a template edit, a config change, a halt someone fixed -- so a
+    // restart syncs, finds nothing changed, and the skip rule drops it. An
+    // ordinary content webhook needs none of this; this one cannot be recovered
+    // any other way.
+    const d = work('accepted-force')
+    const dying = createService({
+      run: () => new Promise<RunReport>(() => {}),
+      lockDir: d,
+      debounceMs: 1,
+      pollMs: 0,
+      log: silentLog,
+    })
+    dying.start()
+    dying.notify(fire({ source: 'manual', force: true }))
+    assert.equal(marker(d), true)
+
+    // A new process over the same work directory.
+    await withGated(d, async (g) => {
+      g.service.start()
+      await new Promise((r) => setTimeout(r, 40))
+      const startup = g.seen.find((t) => t.source === 'startup')
+      assert.ok(startup, 'the restart must run')
+      assert.equal(startup.force, true, 'the force bit must survive the restart')
+    })
+  })
+
+  test('an unreadable marker is treated as outstanding, not as absent', async () => {
+    // The asymmetry is deliberate: this file only exists when a trigger was
+    // acknowledged, so failing to read one is not evidence that none is
+    // outstanding. Forcing costs a build; guessing "nothing here" costs the
+    // publish the file exists to keep.
+    const d = work('accepted-corrupt')
+    writeFileSync(join(d, ACCEPTED_FILE), '{ not json')
+    await withGated(d, async (g) => {
+      g.service.start()
+      await new Promise((r) => setTimeout(r, 40))
+      assert.equal(g.seen.find((t) => t.source === 'startup')?.force, true)
+    })
   })
 })

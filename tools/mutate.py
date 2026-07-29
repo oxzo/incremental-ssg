@@ -434,6 +434,60 @@ MUTATIONS: list[Mutation] = [
         "the shape this replaced: two workers resolving different route sets of equal length agree and the build ships the mixture",
         "test/route-plan.test.ts",
     ),
+    # --- the durable half of a 202 (H6) ---------------------------------------
+    #
+    # The endpoint answers `{ queued: true }`; until this existed that was a
+    # claim about a variable in memory. The load-bearing case is a *forced*
+    # trigger, whose justification is not in the CMS at all -- an ordinary
+    # content webhook is recovered by the next sync either way.
+    Mutation(
+        "service-ack-not-durable",
+        "src/service.ts",
+        "      writeAccepted(lockDir, { force: pending.force, sources: [...pending.sources] })",
+        "      void lockDir",
+        "the 202 goes back before anything records the trigger, so a crash between the two loses what was acknowledged",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "service-ack-marks-every-trigger",
+        "src/service.ts",
+        "    if (lockDir !== null && (t.source === 'webhook' || t.source === 'manual')) {",
+        "    if (lockDir !== null) {",
+        "a poll marks too, so an idle site keeps the marker set forever and every restart forces a publish -- the skip rule becomes unreachable",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "service-ack-never-discharged",
+        "src/service.ts",
+        "      if (completed && pending === null && lockDir !== null) clearAccepted(lockDir)",
+        "      if (false) clearAccepted(lockDir)",
+        "a served trigger is replayed on every restart for the life of the work directory",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "service-ack-discharged-on-failure",
+        "src/service.ts",
+        "      if (completed && pending === null && lockDir !== null) clearAccepted(lockDir)",
+        "      if (pending === null && lockDir !== null) clearAccepted(lockDir)",
+        "a failed run clears the marker, so the trigger it never served is forgotten -- the exact loss this exists to prevent",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "service-ack-force-not-recovered",
+        "src/service.ts",
+        "        force: opts.buildOnStart === true || carried?.force === true,",
+        "        force: opts.buildOnStart === true,",
+        "the recovered trigger comes back unforced, so sync finds nothing changed and the skip rule drops the one case that cannot be recovered any other way",
+        "test/service.test.ts",
+    ),
+    Mutation(
+        "accepted-unreadable-reads-as-absent",
+        "src/accepted.ts",
+        "    return { force: true, sources: ['unreadable-marker'] }",
+        "    return null",
+        "a corrupt marker is read as no-trigger-outstanding, which is the one direction that loses a publish rather than costing a build",
+        "test/service.test.ts",
+    ),
     # --- the second destructive path, and three rails that were simply absent --
     #
     # From an external review's second pass. The asset one is the dangerous one:

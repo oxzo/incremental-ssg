@@ -56,6 +56,7 @@ import { build } from './build.ts'
 import { deploy } from './deploy.ts'
 import { loadSite } from './config.ts'
 import { acquireLock, readLock } from './build-lock.ts'
+import { readAccepted, writeAccepted, clearAccepted } from './accepted.ts'
 import { isTerminal, railOf } from './rails.ts'
 import type { CmsAdapter } from './cms.ts'
 import type { DeployTarget } from './deploy.ts'
@@ -614,6 +615,18 @@ export function createService(opts: ServiceOptions): Service {
     }
     for (const e of t.expectations ?? []) pending.expectations.push(e)
 
+    // Durable before this returns, so the caller's 202 is a claim about the
+    // disk rather than about a variable. Only for the two sources that are an
+    // outside party stating something happened: a poll marking here would leave
+    // the marker permanently set on an idle site and make the skip rule
+    // unreachable, and startup/retry are recoveries rather than new claims.
+    //
+    // Synchronous, so webhook.ts cannot answer before the record exists. That
+    // ordering is the whole point and is why this is not deferred to the run.
+    if (lockDir !== null && (t.source === 'webhook' || t.source === 'manual')) {
+      writeAccepted(lockDir, { force: pending.force, sources: [...pending.sources] })
+    }
+
     arm(t.source === 'webhook' || t.source === 'manual')
   }
 
@@ -650,8 +663,10 @@ export function createService(opts: ServiceOptions): Service {
 
   async function execute(trigger: Trigger) {
     runs++
+    let completed = false
     try {
       const report = await opts.run(trigger)
+      completed = true
       lastReport = report
       lastError = null
       consecutiveFailures = 0
@@ -690,6 +705,12 @@ export function createService(opts: ServiceOptions): Service {
       }
     } finally {
       running = null
+      // The acknowledgement is discharged only by a run that finished, and only
+      // if nothing arrived while it was in flight -- a later trigger inherits
+      // the marker rather than being covered by this run. A failed or halted run
+      // leaves it set on purpose: what was acknowledged has not happened, and a
+      // restart should still know that.
+      if (completed && pending === null && lockDir !== null) clearAccepted(lockDir)
       // A trigger that arrived while this run was in flight. Immediate, not
       // debounced: it already waited out a whole build.
       if (pending !== null && halted === null) arm(false)
@@ -715,11 +736,25 @@ export function createService(opts: ServiceOptions): Service {
     start() {
       stopped = false
       if (pollMs > 0) pollTimer = setInterval(() => notify({ source: 'poll' }), pollMs)
+      // A trigger this process acknowledged and never ran. Recovered here rather
+      // than left to the dirty flag, because the flag cannot represent the case
+      // that needs recovering: a forced trigger's justification is not in the
+      // CMS -- a template edit, a config change, a halt someone fixed -- so a
+      // restart syncs, finds nothing changed, and the skip rule drops it. The
+      // force bit is the payload; recovering ordinary webhooks is the cheap
+      // side effect.
+      const carried = lockDir === null ? null : readAccepted(lockDir)
+      if (carried !== null) {
+        log({ event: 'trigger.recovered', force: carried.force, sources: carried.sources })
+      }
       // Always triggered, force or not. An unforced startup run still publishes
       // when the store's dirty flag survived a crash mid-build, which is how a
       // restart recovers an outstanding publish without republishing the whole
       // site on every restart.
-      notify({ source: 'startup', force: opts.buildOnStart === true })
+      notify({
+        source: 'startup',
+        force: opts.buildOnStart === true || carried?.force === true,
+      })
       log({ event: 'service.started', debounceMs, maxDelayMs, pollMs })
     },
     async stop() {
