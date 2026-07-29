@@ -85,11 +85,31 @@ export async function startFakeDirectus(
      * terminal while 503 does not.
      */
     failLoginWith?: number[]
+    /**
+     * Invalidate the issued token after this many authorised item requests.
+     *
+     * The case the suite claimed to cover and did not: a test named "re-logs in
+     * exactly once when the token expires mid-sync" asserted one login on a
+     * *healthy* sync, because nothing here could expire anything. So the adapter's
+     * 401-then-reauth path -- the one branch that can turn a live sync into an
+     * infinite login loop if it re-authenticates unconditionally -- had no test
+     * at all.
+     *
+     * The next login issues a fresh token that works, which is what makes the
+     * difference between "one re-login clears a stale token" and "every 401
+     * triggers a login" observable rather than argued.
+     */
+    expireTokenAfter?: number
   } = {},
 ): Promise<FakeDirectus> {
   const token = opts.token ?? 'fake-token'
   const seen: { path: string; query: Record<string, string> }[] = []
   const loginFailures = [...(opts.failLoginWith ?? [])]
+  // The token the server currently accepts. Only ever differs from `token` when
+  // expireTokenAfter is set, so every other test sees exactly the old behaviour.
+  let live = token
+  let generation = 0
+  let served = 0
 
   const server: Server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://fake')
@@ -105,12 +125,28 @@ export async function startFakeDirectus(
       const injected = loginFailures.shift()
       if (injected !== undefined) return json(res, injected, { errors: [{ message: 'injected' }] })
       if (body.password === 'wrong') return json(res, 401, { errors: [{ message: 'bad credentials' }] })
-      return json(res, 200, { data: { access_token: token } })
+      // A fresh token per login, but only when expiry is in play -- otherwise
+      // this is the constant it has always been.
+      if (opts.expireTokenAfter !== undefined) live = `${token}-${++generation}`
+      served = 0
+      return json(res, 200, { data: { access_token: live } })
     }
 
     if (opts.requireAuth !== false) {
       const auth = String(req.headers.authorization ?? '')
-      if (auth !== `Bearer ${token}`) return json(res, 401, { errors: [{ message: 'unauthorized' }] })
+      if (auth !== `Bearer ${live}`) return json(res, 401, { errors: [{ message: 'unauthorized' }] })
+      // Exactly this many good requests per token, then a 401. Checked before
+      // serving rather than after, so `expireTokenAfter: 0` means a token that
+      // is dead on arrival -- the case where a re-login cannot help, and the one
+      // that would spin forever against an adapter that answers every 401 by
+      // logging in again.
+      if (opts.expireTokenAfter !== undefined) {
+        if (served >= opts.expireTokenAfter) {
+          live = `${token}-expired-${generation}`
+          return json(res, 401, { errors: [{ message: 'token expired' }] })
+        }
+        served++
+      }
     }
 
     const m = /^\/items\/([^/]+)$/.exec(url.pathname)

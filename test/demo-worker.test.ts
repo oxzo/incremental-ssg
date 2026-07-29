@@ -56,6 +56,19 @@ describe('demo worker — path mapping', () => {
     assert.equal(keysFor('/tags/tag%2D0/').key, 'tags/tag-0/index.html')
   })
 
+  test('a malformed escape is a refusal, not a throw', () => {
+    // decodeURIComponent throws URIError on these, and an uncaught throw in a
+    // Worker is a 500 -- reporting a fault on this side for a request that was
+    // malformed on the other, and putting a stack in the logs for something any
+    // client can send at will.
+    for (const bad of ['/%', '/%zz', '/posts/%E0%A4%A/', '/%C0%80/']) {
+      const r = keysFor(bad)
+      assert.equal(r.key, null, `${bad} should not resolve to a key`)
+      assert.match((r as { reason: string }).reason, /percent-encoding/)
+    }
+  })
+
+
   /**
    * The mapping is only correct relative to what the build emits, and that is a
    * moving target. This walks a real output tree and asserts every emitted file
@@ -105,6 +118,21 @@ describe('demo worker — caching', () => {
 
 describe('demo worker — responses', () => {
   const env = { SITE: fakeBucket(['index.html', 'posts/post-7/index.html', 'feed.xml']) } as never
+
+  test('answers a malformed path 400, without touching the bucket', async () => {
+    let asked = 0
+    const counting = {
+      SITE: { get: async (key: string) => { asked++; return fakeBucket(['index.html']).get(key) } },
+    } as never
+    const res = await worker.fetch(req('/%zz'), counting)
+    // 400 rather than the 500 an uncaught URIError produced: the request was
+    // malformed on the client's side, and saying so is both the accurate status
+    // and the one that keeps a client-triggerable stack out of the logs.
+    assert.equal(res.status, 400)
+    assert.match(await res.text(), /malformed percent-encoding/)
+    // Refused before the lookup, because there is no key to look up.
+    assert.equal(asked, 0)
+  })
 
   test('serves an existing page with the stored content type', async () => {
     const res = await worker.fetch(req('/posts/post-7/'), env)

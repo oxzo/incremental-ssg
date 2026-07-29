@@ -140,6 +140,18 @@ MUTATIONS: list[Mutation] = [
         "a login failure that escapes the attempt loop gets one try, no backoff, and none of the wait budget",
         "test/cms-directus.test.ts",
     ),
+    # The stale-token branch, which had no test until the fake could expire one.
+    # test/cms-directus.test.ts carried a case *named* for it that asserted one
+    # login on a healthy sync, so the branch was uncovered under a name that said
+    # otherwise -- worth more than an uncovered branch nobody claimed.
+    Mutation(
+        "cms-expired-token-not-refreshed",
+        "src/cms-directus.ts",
+        "          if (reauthed) return false",
+        "          return false",
+        "a token that outlives one sync fails every sync after it, so publishing stops at the Directus session length",
+        "test/cms-directus.test.ts",
+    ),
     Mutation(
         "cms-envelope-not-stripped",
         "src/cms-directus.ts",
@@ -892,6 +904,15 @@ MUTATIONS: list[Mutation] = [
         "  })\n  console.log(\n    `${r.strategy}:",
         "an unhandled rejection prints the refusal as a stack with the explanation folded into the frames",
         "test/cli-refusals.test.ts",
+    ),
+    # --- the reader in front of the bucket ------------------------------------
+    Mutation(
+        "worker-malformed-path-is-a-500",
+        "demo/worker/src/index.ts",
+        "  let decoded: string\n  try {\n    decoded = decodeURIComponent(pathname)\n  } catch {\n    return { key: null, reason: 'malformed percent-encoding in path' }\n  }",
+        "  const decoded = decodeURIComponent(pathname)",
+        "an uncaught URIError is a Worker 500, which reports a fault on this side for a request malformed on the other",
+        "test/demo-worker.test.ts",
     ),
     # --- draining a pool before reporting that it failed ----------------------
     #

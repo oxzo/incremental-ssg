@@ -306,13 +306,61 @@ describe('directus adapter — resilience', () => {
     await assert.rejects(() => adapter.list({ cursor: null, limit: 100 }))
   })
 
-  test('re-logs in exactly once when the token expires mid-sync', async () => {
+  test('logs in exactly once for a healthy sync', async () => {
+    // Renamed. This used to be called "re-logs in exactly once when the token
+    // expires mid-sync" and nothing in it expired anything -- the fake served
+    // one constant token forever, so the assertion below was the whole test and
+    // the re-login path it named had no coverage at all. The expiry case is the
+    // test after this one; this is the control it needs.
     const rows = fakeRows({ post: 2 })
     const fake = track(await startFakeDirectus(rows, { token: 'first' }))
     const adapter = adapterFor(fake.url, ['post'])
     await drain(adapter, 100)
     const logins = fake.requests().filter((r) => r.path === '/auth/login').length
     assert.equal(logins, 1, 'one login for a healthy sync')
+  })
+
+  test('re-logs in once when the token expires mid-sync, and finishes the listing', async () => {
+    // An expired token is not an authorisation failure, it is a stale one, and
+    // the difference is that exactly one re-login fixes it. Not re-logging in at
+    // all turns an ordinary token lifetime into a sync that fails every time it
+    // outlives one -- which under `serve` is publishing that stops at whatever
+    // the Directus session length happens to be.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 6 }), { expireTokenAfter: 1 }))
+    const adapter = adapterFor(fake.url, ['post'], { backoffMs: 1 })
+    const { ids } = await drain(adapter, 2)
+    // The listing completed across the expiry rather than failing at it.
+    assert.deepEqual(ids, ['post-0', 'post-1', 'post-2', 'post-3', 'post-4', 'post-5'])
+    const logins = fake.requests().filter((r) => r.path === '/auth/login').length
+    // One login per expiry, not one per request: the token is only refreshed
+    // when a 401 says it is stale, and each refresh serves a request before
+    // expiring again.
+    assert.ok(logins > 1, `the token actually expired (${logins} logins)`)
+    assert.ok(logins <= 5, `one re-login per expiry, not per request (${logins} logins)`)
+  })
+
+  test('a 401 that a re-login does not clear is terminal, not a login loop', async () => {
+    // The other side of the same branch. `reauthed` is per request, so a second
+    // 401 after a fresh token means the token is not the problem, and the
+    // request ends as a refusal rather than as more logins.
+    //
+    // What bounds it is the attempt budget, not `reauthed` -- said plainly,
+    // because "re-logging in on every 401 would be an infinite loop" is the
+    // obvious reading of that flag and it is not true here. The flag stops the
+    // budget being *spent* on re-logins that the first one already proved
+    // useless; the budget is what guarantees the request ends at all.
+    const fake = track(await startFakeDirectus(fakeRows({ post: 1 }), {
+      // Expires immediately and stays expired: every login issues a token the
+      // very next request rejects.
+      expireTokenAfter: 0,
+    }))
+    const adapter = adapterFor(fake.url, ['post'], { backoffMs: 1, attempts: 3 })
+    await assert.rejects(
+      () => adapter.list({ cursor: null, limit: 10 }),
+      (e: unknown) => e instanceof RailError && e.rail === 'cms.request',
+    )
+    const logins = fake.requests().filter((r) => r.path === '/auth/login').length
+    assert.ok(logins <= 3, `bounded by the attempt budget, not looping (${logins} logins)`)
   })
 
   test('treats bad credentials as terminal rather than retrying them', async () => {

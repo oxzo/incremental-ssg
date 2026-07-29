@@ -213,6 +213,16 @@ deploy stage to the asset naming scheme. Listing cost is still unmeasured — a
 directory target is free, but a real target paginates, so a 24,449-object site
 is ~25 requests and Phase 2b's finding was that request *count* dominates.
 
+Upload memory is the other one, and it is pinned by an interface rather than by
+an oversight. `DeployTarget.put(path, body: Buffer, …)` takes bytes, so the
+upload pool reads each file fully into memory before sending it — peak is
+roughly `concurrency × largest file`, which at the default of 8 is fine for HTML
+and is not a bound anyone has checked against a large video. The read is also
+`readFileSync`, so it blocks the event loop the concurrency exists to exploit.
+Both are fixed by the same change — a streaming `put` — and that is an interface
+change touching every target, which is why it is named here rather than patched
+around at the call site.
+
 ## AVIF effort is the largest single tunable
 
 At 1600px: effort 0 = 87ms, effort 2 = 194ms, effort 4 (**sharp's default**) =
@@ -386,11 +396,19 @@ object reads as modified on every deploy, forever.
 ## Checks
 
 ```sh
-npm test           # 285 tests
+npm test
 npm run typecheck  # tsc, strict, no emit — Node strips types and checks nothing
 npm run test:mutate  # break each rail in turn; every one must fail a test
 npm audit --omit=dev
 ```
+
+No test or mutation count here, on purpose. There was one, it went stale, a
+commit corrected it, and it went stale again — a number that has to be
+hand-updated on every commit that adds a test is a number that is wrong most of
+the time, and a README that is wrong about something checkable is worth less
+than one that declines to say. `npm test` prints the count, and CI runs it on
+every push. Where a count appears elsewhere in this repository it is dated and
+past tense, describing what was true at a moment rather than now.
 
 `demo/worker` is a separate npm package and is checked separately, against the
 Cloudflare runtime whose globals are not Node's:

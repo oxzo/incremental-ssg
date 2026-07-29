@@ -53,8 +53,29 @@ export interface Env {
  * the index treatment too, then a redirect, so `/posts/post-7` and
  * `/posts/post-7/` do not become two URLs serving one page.
  */
-export function keysFor(pathname: string): { key: string; redirectTo?: string } {
-  const path = decodeURIComponent(pathname).replace(/^\/+/, '')
+export type KeyResult =
+  | { key: string; redirectTo?: string }
+  /** The path could not be decoded. `reason` is safe to put in a response body. */
+  | { key: null; reason: string }
+
+export function keysFor(pathname: string): KeyResult {
+  // decodeURIComponent throws URIError on a malformed escape -- `/%` and `/%zz`
+  // are the short ones -- and an uncaught throw in a Worker is a 500. That is
+  // the wrong answer twice over: it reports a fault on this side for a request
+  // that was malformed on the other, and it puts a stack in the Cloudflare logs
+  // for something a client can send at will.
+  //
+  // Not a traversal risk, which is worth stating so the guard is not read as
+  // more than it is: R2 keys are a flat namespace, `..` is an ordinary
+  // character in one, and a decoded `../` simply names an object that does not
+  // exist. This is about the status code, not about containment.
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(pathname)
+  } catch {
+    return { key: null, reason: 'malformed percent-encoding in path' }
+  }
+  const path = decoded.replace(/^\/+/, '')
 
   if (path === '') return { key: 'index.html' }
   if (path.endsWith('/')) return { key: `${path}index.html` }
@@ -90,7 +111,16 @@ export default {
     }
 
     const url = new URL(request.url)
-    const { key, redirectTo } = keysFor(url.pathname)
+    const result = keysFor(url.pathname)
+    if (result.key === null) {
+      // The client's mistake, reported as the client's mistake. Answered before
+      // the bucket is touched, because there is no key to ask for.
+      return new Response(`400 bad request: ${result.reason}`, {
+        status: 400,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      })
+    }
+    const { key, redirectTo } = result
 
     const object = await env.SITE.get(key)
     if (object === null) {

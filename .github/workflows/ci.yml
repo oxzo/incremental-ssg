@@ -1,8 +1,15 @@
 # The suite as a merge gate rather than a thing someone remembers to run.
 #
-# This repository had 264 tests, 35 mutations and no CI, which means every one of
-# those was evidence about one machine at one moment. The point of this file is
-# not more checking — it is the same checking, enforced.
+# When this file was added the repository had 264 tests, 35 mutations and no CI,
+# which means every one of those was evidence about one machine at one moment.
+# The point of this file is not more checking — it is the same checking,
+# enforced.
+#
+# Those two numbers describe that moment and are not maintained; both have grown
+# a long way since. Said explicitly because a review has already read them as a
+# count of the current suite and filed the difference as documentation drift —
+# which is the right instinct, and the reason the README no longer quotes a
+# count at all. `npm test` and `npm run test:mutate` below print the live ones.
 #
 # Two Node versions: the minimum `engines` claims, because a claim nobody tests
 # is a guess, and current, because that is what a new contributor will have.
