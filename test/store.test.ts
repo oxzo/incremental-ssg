@@ -2,6 +2,7 @@ import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DocumentStore, STORE_SCHEMA, documentIdentity, documentKey } from '../src/store.ts'
+import type { RailError } from '../src/rails.ts'
 import { tmpdir, cleanup } from './fixture.ts'
 
 const dirs: string[] = []
@@ -200,6 +201,21 @@ describe('DocumentStore — (type, id) is the key', () => {
     const s = new DocumentStore(path)
     s.setMeta('schema', String(STORE_SCHEMA - 1))
     s.close()
-    assert.throws(() => new DocumentStore(path), /Delete the database and re-sync/)
+    assert.throws(
+      () => new DocumentStore(path),
+      (e: unknown) => {
+        assert.match((e as Error).message, /Delete the database and re-sync/)
+        // Terminal, and the least ambiguous case in the codebase: the file
+        // records a version, the binary expects another, and the next run
+        // compares the same two numbers. The remedy the message names is a
+        // human deleting a file, which is the definition of terminal.
+        //
+        // A plain Error until the classification sweep, so `isTerminal` read it
+        // as transient by default and the service retried a comparison that
+        // cannot move -- busy logs, no publishing, and a stale site.
+        assert.equal((e as RailError).terminal, true)
+        assert.equal((e as RailError).rail, 'store.schema')
+        return true
+      })
   })
 })

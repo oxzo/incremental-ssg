@@ -225,6 +225,13 @@ const die = (e: unknown): never => {
   process.exit(1)
 }
 
+// Every command routes its failures through `die`. `sync` was the one that did
+// not -- an omission rather than a decision, and the command with the most to
+// lose by it: `sync.short-listing` and `cms.duplicate-document` are the two most
+// carefully worded refusals in the codebase, each several sentences explaining
+// what was not done and why, and an unhandled rejection printed them as the
+// first line of a stack trace with the explanation folded into the frames.
+
 const command = process.argv[2]
 const argv = process.argv.slice(3)
 
@@ -292,7 +299,7 @@ if (command === 'sync') {
     } finally {
       store.close()
     }
-  })
+  }).catch(die)
   console.log(
     `${r.strategy}: ${r.pulled} pulled, ${r.changed} changed, ${r.deleted} deleted, ` +
     `${r.requests} requests, ${(r.bytes / 1024 / 1024).toFixed(1)} MiB, ${ms(r.ms.total)}`)

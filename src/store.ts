@@ -135,7 +135,18 @@ export class DocumentStore {
     const found = this.getMeta('schema')
     if (found === null) this.setMeta('schema', String(STORE_SCHEMA))
     else if (Number(found) !== STORE_SCHEMA) {
-      throw new Error(
+      // Terminal, and it is the least ambiguous case in the codebase: the file
+      // on disk records a version, the binary expects another, and the next run
+      // compares the same two numbers. The message already names the remedy and
+      // the remedy is a human deleting a file -- so a service retrying this
+      // would loop on a comparison that cannot move while the site went stale.
+      //
+      // A plain Error until now, which `isTerminal` reads as transient by
+      // design. The default is right for an unclassified failure and wrong for
+      // one this specific.
+      throw new RailError(
+        'store.schema',
+        true,
         `store schema ${found} != ${STORE_SCHEMA} at ${this.path}. Delete the ` +
         `database and re-sync; the mirror is reproducible from the CMS.`)
     }
@@ -144,7 +155,10 @@ export class DocumentStore {
   private checkSchema() {
     const found = this.getMeta('schema')
     if (found !== null && Number(found) !== STORE_SCHEMA) {
-      throw new Error(`store schema ${found} != ${STORE_SCHEMA} at ${this.path}`)
+      throw new RailError(
+        'store.schema',
+        true,
+        `store schema ${found} != ${STORE_SCHEMA} at ${this.path}`)
     }
   }
 

@@ -11,6 +11,7 @@
 // module path, not a closure, so the site definition must be a module.
 import { pathToFileURL } from 'node:url'
 import { isAbsolute, resolve } from 'node:path'
+import { RailError } from './rails.ts'
 import type { AssetEntry, Fmt } from './asset-cache.ts'
 
 /** A content document as stored. Only `id` is guaranteed by the engine. */
@@ -136,11 +137,27 @@ export async function loadSite(modulePath: string): Promise<SiteConfig<unknown>>
   const abs = isAbsolute(modulePath) ? modulePath : resolve(modulePath)
   const mod = (await import(pathToFileURL(abs).href)) as Record<string, unknown>
   const cfg = (mod.default ?? mod.site) as SiteConfig<unknown> | undefined
+  // Both refusals below are terminal, and for the same reason: a module either
+  // exports a SiteConfig or it does not, and the next import of the same path
+  // answers identically -- ESM caches by URL, so even a mid-flight edit does not
+  // reach a running process. What changes the answer is a person editing the
+  // site module, which is exactly what `terminal` means.
+  //
+  // Worth stating because these are the rails a *new* deployment meets first. A
+  // plain Error is transient by default, so a service pointed at a site module
+  // it cannot load used to retry it on a widening backoff, reporting healthy
+  // right up until the consecutive-failure count caught up -- rather than
+  // halting and naming the file it could not read.
   if (!cfg || typeof cfg !== 'object') {
-    throw new Error(`${modulePath} has no default export (or named export \`site\`) holding a SiteConfig`)
+    throw new RailError(
+      'site.config',
+      true,
+      `${modulePath} has no default export (or named export \`site\`) holding a SiteConfig`)
   }
   for (const field of ['name', 'contentTypes', 'index', 'routes', 'templates'] as const) {
-    if (cfg[field] === undefined) throw new Error(`${modulePath}: SiteConfig is missing \`${field}\``)
+    if (cfg[field] === undefined) {
+      throw new RailError('site.config', true, `${modulePath}: SiteConfig is missing \`${field}\``)
+    }
   }
   return cfg
 }

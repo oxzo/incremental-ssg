@@ -10,8 +10,9 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, relative, sep } from 'node:path'
 import { scanTree } from '../src/hash-tree.ts'
+import { findSources } from '../src/assets.ts'
 import { RailError } from '../src/rails.ts'
 
 const roots: string[] = []
@@ -149,5 +150,117 @@ describe('tree walk — what is not refused', () => {
     const scan = scanTree(out, ['sha256'])
     assert.equal(scan.files, 2)
     assert.deepEqual([...scan.digests[0].keys()].sort(), ['index.html', 'posts/a.html'])
+  })
+})
+
+// The other walk, on the same axis, now answering the same way.
+//
+// `findSources` scans the asset *source* tree and used `stat`, which follows a
+// link and reports on whatever it points at. hash-tree's walk uses `lstat` and
+// refuses one outright. Same question, opposite answers, and no stated reason
+// for the disagreement -- the shape that produced two pools and two spellings of
+// isInside() in this codebase already.
+//
+// Placed beside them rather than in an assets file on purpose: two walks that
+// agree only by coincidence stay agreed until someone edits one, and the cheapest
+// way to notice is for both to be refused in the same file.
+describe('asset source walk — the same refusals as the tree walk', () => {
+  /** A source directory with one real image in it, plus whatever the case adds. */
+  const sources = (build: (dir: string, base: string) => void) => {
+    const base = mkdtempSync(join(tmpdir(), 'issg-assets-'))
+    roots.push(base)
+    const dir = join(base, 'img')
+    mkdirSync(dir, { recursive: true })
+    // Contents are never read -- findSources selects on extension and stats, and
+    // nothing decodes until AssetCache.process. So a byte is a sufficient image.
+    writeFileSync(join(dir, 'real.png'), 'x')
+    build(dir, base)
+    return dir
+  }
+
+  const refusesSource = async (dir: string, rail: string, message: RegExp) =>
+    assert.rejects(
+      () => findSources(dir),
+      (e: unknown) => e instanceof RailError && e.rail === rail && e.terminal && message.test(e.message),
+    )
+
+  test('refuses a symlink to an image outside the source directory', async () => {
+    // checkDisjointRoots compares *resolved* paths and says plainly that it does
+    // not detect a symlink routing one root inside another. This is the gap that
+    // sentence names, from the source side.
+    const dir = sources((_dir, base) => {
+      writeFileSync(join(base, 'outside.png'), 'x')
+      symlinkSync(join(base, 'outside.png'), join(_dir, 'linked.png'))
+    })
+    await refusesSource(dir, 'assets.symlink', /^linked\.png is a symbolic link/)
+  })
+
+  test('refuses a symlink to a directory rather than encoding an arbitrary subtree', async () => {
+    const dir = sources((_dir, base) => {
+      const elsewhere = join(base, 'elsewhere')
+      mkdirSync(elsewhere)
+      writeFileSync(join(elsewhere, 'private.png'), 'x')
+      symlinkSync(elsewhere, join(_dir, 'sub'))
+    })
+    await refusesSource(dir, 'assets.symlink', /^sub is a symbolic link/)
+  })
+
+  test('refuses a broken symlink as a symlink, not as a bare ENOENT', async () => {
+    // What this used to do, and the concrete half of the finding: `stat` throws
+    // ENOENT on a dangling link, and the guard in findSources catches ENOENT
+    // only around the readdir -- so the build died with a filesystem error from
+    // the middle of a walk, naming a path the caller never configured.
+    const dir = sources((_dir, base) => symlinkSync(join(base, 'gone.png'), join(_dir, 'dangling.png')))
+    await refusesSource(dir, 'assets.symlink', /^dangling\.png is a symbolic link/)
+  })
+
+  test('refuses a symlink cycle at the link instead of recursing into one', async () => {
+    const dir = sources((d) => symlinkSync(d, join(d, 'loop')))
+    await refusesSource(dir, 'assets.symlink', /^loop is a symbolic link/)
+  })
+
+  test('refuses a non-regular entry that looks like a source image', async () => {
+    // Narrower than the tree walk's equivalent, and deliberately: this walk
+    // selects on extension, so an unrelated socket in the source directory was
+    // never going to be read and refusing it would fail builds doing nothing
+    // wrong. One named `hero.png` is the case that reaches sharp and blocks.
+    const server = createServer()
+    const dir = sources(() => {})
+    await new Promise<void>((r) => server.listen(join(dir, 'hero.png'), () => r()))
+    try {
+      await refusesSource(dir, 'assets.entry', /^hero\.png looks like a source image/)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+
+  test('a socket that is not image-shaped is ignored rather than refused', async () => {
+    const server = createServer()
+    const dir = sources(() => {})
+    await new Promise<void>((r) => server.listen(join(dir, 'ipc.sock'), () => r()))
+    try {
+      assert.deepEqual((await findSources(dir)).map((p) => basename(p)), ['real.png'])
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+
+  test('walks an ordinary source tree unchanged, sorted', async () => {
+    // The control. A walk that refused everything would pass all of the above.
+    const dir = sources((d) => {
+      mkdirSync(join(d, 'hero'))
+      writeFileSync(join(d, 'hero', 'banner.jpg'), 'x')
+      writeFileSync(join(d, 'notes.txt'), 'not an image')
+    })
+    assert.deepEqual(
+      (await findSources(dir)).map((p) => relative(dir, p).split(sep).join('/')),
+      ['hero/banner.jpg', 'real.png'],
+    )
+  })
+
+  test('a missing source directory is still zero sources, not a refusal', async () => {
+    // Unchanged behaviour, pinned because the lstat swap runs right beside the
+    // ENOENT guard that provides it.
+    assert.deepEqual(await findSources(join(mkdtempSync(join(tmpdir(), 'issg-none-')), 'nope')), [])
   })
 })

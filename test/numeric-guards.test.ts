@@ -25,6 +25,7 @@ import { sync } from '../src/sync.ts'
 import { RailError, checkNumber } from '../src/rails.ts'
 import { startMockCms } from '../src/cms-mock.ts'
 import { httpCmsAdapter } from '../src/cms.ts'
+import { resolveAssetConfig } from '../src/assets.ts'
 import { tmpdir, cleanup, seedStore, blogDocs } from './fixture.ts'
 
 const REPO = resolve(import.meta.dirname, '..')
@@ -239,6 +240,28 @@ describe('counts that failed to parse', () => {
       store.close()
       await cms.close()
     }
+  })
+
+  test('the asset stage refuses NaN concurrency, which would encode nothing', async () => {
+    // The one the A2 sweep missed, and the reason it missed it: no CLI flag
+    // points at this. The value comes from a site module, so the flag-level
+    // guard in cli.ts never sees it and `resolveAssetConfig` passed it straight
+    // through. Measured against pool(): `Math.min(Math.max(1, NaN), 5)` is NaN,
+    // `Array.from({length: NaN})` builds zero runners, and pool ran 0 of 5 jobs
+    // and resolved successfully with a sparse array. For a build that is every
+    // image missing, reported as success -- and then gc() collecting against the
+    // empty keep-set that produced.
+    assert.throws(
+      () => resolveAssetConfig({ sources: '/a', outDir: '/b', concurrency: Number('oops') }),
+      (e: unknown) => {
+        assert.equal((e as RailError).rail, 'invalid-number')
+        assert.match((e as Error).message, /concurrency/)
+        return true
+      })
+    // Control: a usable value passes through, and an absent one takes the
+    // default rather than being refused as missing.
+    assert.equal(resolveAssetConfig({ sources: '/a', outDir: '/b', concurrency: 3 }).concurrency, 3)
+    assert.ok(resolveAssetConfig({ sources: '/a', outDir: '/b' }).concurrency >= 1)
   })
 
   test('sync refuses NaN maxRequests, which would leave the pull loop unbounded', async () => {

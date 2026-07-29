@@ -13,6 +13,7 @@
 // different cost model, which is why `capabilities` is data the sync driver
 // branches on rather than something each adapter silently works around.
 import { requestWithRetry, retryPolicy } from './http-retry.ts'
+import { RailError } from './rails.ts'
 import type { RetryOptions } from './http-retry.ts'
 
 export type CmsDocument = {
@@ -173,11 +174,30 @@ export function httpCmsAdapter(opts: HttpCmsOptions): CmsAdapter {
       const body = await getJson(`${base}/ids`)
       // [id, revision, type] rather than [id, revision]: the mirror is keyed by
       // (type, id), so an entry without a type cannot be compared against it.
-      return (body.ids as [string, string, string][]).map(([id, revision, type]) => ({
-        type: String(type ?? ''),
-        id,
-        revision: String(revision ?? ''),
-      }))
+      return (body.ids as [string, string, string][]).map(([id, revision, type]) => {
+        // Refused rather than coerced, because the comment above already says
+        // this entry cannot be compared and `String(undefined ?? '')` compared
+        // it anyway -- against the type `''`, which no document has. This
+        // listing goes straight into DocumentStore.deleteMissing, so every
+        // entry the CMS failed to type reads as a document that no longer
+        // exists, and the ratio ceiling waves through anything under half the
+        // mirror. A wrong answer arriving as a valid-looking string is the
+        // shape this project treats as worse than a crash.
+        //
+        // Transient, matching sync.short-listing rather than the config rails:
+        // this is a fact about one listing at one moment, and a CMS mid-deploy
+        // serving a half-migrated response resolves itself on the next attempt.
+        if (typeof type !== 'string' || type === '') {
+          throw new RailError(
+            'cms.untyped-id',
+            false,
+            `the id listing returned "${id}" with no content type (got ${JSON.stringify(type)}). ` +
+            `The mirror is keyed by (type, id), so an entry without a type names no document — ` +
+            `and this listing decides which documents still exist, so accepting it would read ` +
+            `as a deletion. Nothing was removed; retry.`)
+        }
+        return { type, id, revision: String(revision ?? '') }
+      })
     },
     revisionOf(payload: unknown) {
       const p = payload as any

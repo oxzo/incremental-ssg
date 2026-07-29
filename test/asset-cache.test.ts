@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import sharp from 'sharp'
 import { AssetCache, defaultConfig, type AssetConfig } from '../src/asset-cache.ts'
+import type { RailError } from '../src/rails.ts'
 
 let root: string
 let srcDir: string
@@ -249,7 +250,19 @@ describe('AssetCache', () => {
     await makeImage(src, 300, 200)
     const c = new AssetCache(cfg(out))
     await c.process(src)
-    await assert.rejects(() => c.gc(), /requires seal\(\)/)
+    await assert.rejects(
+      () => c.gc(),
+      (e: unknown) => {
+        assert.match((e as Error).message, /requires seal\(\)/)
+        // Terminal. This fires only when a caller reached gc() without seal(),
+        // which is a fact about the code and not about the run -- the next
+        // attempt executes the same two calls in the same order. A plain Error
+        // until the classification sweep, and a plain Error is transient by
+        // default, so the service used to retry a caller bug on a backoff.
+        assert.equal((e as RailError).terminal, true)
+        assert.equal((e as RailError).rail, 'assets.gc-unsealed')
+        return true
+      })
     assert.equal((await readdir(out)).length, 2, 'nothing deleted')
   })
 
@@ -267,7 +280,22 @@ describe('AssetCache', () => {
     await partial.process(names[0])   // forgot b and c -- a partial build
     partial.seal()
     // 4 of 6 doomed = 67%, over the limit.
-    await assert.rejects(() => partial.gc(), /over the 50% limit/)
+    await assert.rejects(
+      () => partial.gc(),
+      (e: unknown) => {
+        assert.match((e as Error).message, /over the 50% limit/)
+        // Terminal, and README.md's "same rail shape as deleteMissing and the
+        // deploy diff" is what makes that a decision rather than a reading:
+        // those two are classified differently from each other. The keep-set is
+        // what decides it. deleteMissing's comes from a CMS listing, which can
+        // come back short for a moment; this one is every source in the
+        // directory the build just walked, so the next run walks the same
+        // directory and reaches the same ratio -- and a service retrying it
+        // would re-refuse forever while the site went stale.
+        assert.equal((e as RailError).terminal, true)
+        assert.equal((e as RailError).rail, 'assets.gc-ratio')
+        return true
+      })
     assert.equal((await readdir(out)).length, 6, 'live derivatives survived')
 
     const forced = await partial.gc({ force: true })

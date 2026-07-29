@@ -171,6 +171,41 @@ describe('httpCmsAdapter — a request that does not work', () => {
     assert.ok(elapsed < 2_000, `capped wait, took ${elapsed.toFixed(0)}ms`)
   })
 
+  test('an id listing entry with no content type is refused, not coerced', async () => {
+    // The comment in listIds() already said an entry without a type cannot be
+    // compared against a mirror keyed by (type, id) -- and then compared it
+    // anyway, against `String(undefined ?? '')`. No document has type `''`, so
+    // every untyped entry read as a document that no longer exists, and this
+    // listing is what feeds deleteMissing. Ten untyped entries in a listing of
+    // twenty is a mass unpublish that the ratio ceiling waves through.
+    let requests = 0
+    const server = createServer((_req, res) => {
+      requests++
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ids: [['p1', 'r1', 'post'], ['p2', 'r2']] }))
+    })
+    servers.push(server)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const adapter = httpCmsAdapter({
+      baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      attempts: 1,
+    })
+    await assert.rejects(
+      () => adapter.listIds(),
+      (e: unknown) => {
+        assert.ok(e instanceof RailError)
+        assert.match(e.message, /"p2" with no content type/)
+        // Transient, matching sync.short-listing: this is a fact about one
+        // listing at one moment, not about the content. A CMS mid-deploy
+        // serving a half-migrated response resolves itself on the next attempt,
+        // and the refusal itself removed nothing.
+        assert.equal(e.terminal, false)
+        assert.equal(e.rail, 'cms.untyped-id')
+        return true
+      })
+    assert.equal(requests, 1)
+  })
+
   test('the id listing is on the same terms as the document listing', async () => {
     // Two endpoints, one policy. listIds() feeds deleteMissing, so an unretried
     // blip there does not merely fail a sync -- it is the request whose answer

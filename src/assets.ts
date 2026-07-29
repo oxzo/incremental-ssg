@@ -21,12 +21,12 @@
 //    happened to link" would delete live derivatives the moment a route failed
 //    to render. Scanning the directory makes the keep-set complete by
 //    construction rather than by hoping the render pass finished.
-import { readdir, stat, link, copyFile, mkdir } from 'node:fs/promises'
+import { readdir, lstat, link, copyFile, mkdir } from 'node:fs/promises'
 import { basename, join, relative, extname, sep } from 'node:path'
 import { AssetCache, defaultConfig } from './asset-cache.ts'
 import type { AssetEntry, AssetConfig, CacheStats } from './asset-cache.ts'
 import type { SiteAssets } from './config.ts'
-import { checkDisjointRoots } from './rails.ts'
+import { checkDisjointRoots, checkNumber, RailError } from './rails.ts'
 
 /** Formats sharp can decode that are worth treating as site imagery. */
 const SOURCE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif', '.tif', '.tiff', '.gif'])
@@ -59,11 +59,41 @@ export function resolveAssetConfig(assets: SiteAssets): AssetConfig {
     // override that silently inherits it would reintroduce exactly the accident
     // the explicit config was written to prevent.
     effort: assets.effort ?? base.effort,
-    concurrency: assets.concurrency ?? base.concurrency,
+    // Through checkNumber like every other count, and the exact shape the A2
+    // sweep was for: this one was missed because no CLI flag points at it, so
+    // the value arrives from a site module instead of a command line and the
+    // flag-level guard in cli.ts never sees it. `pool(jobs, NaN)` builds
+    // `Math.min(Math.max(1, NaN), jobs.length)` runners, which is NaN, which
+    // `Array.from({length: NaN})` reads as zero -- measured: it ran 0 of 5 jobs
+    // and resolved successfully with a sparse array. For the asset stage that is
+    // a build that encodes no images, reports success, and then hands gc() a
+    // keep-set of nothing.
+    concurrency: checkNumber(assets.concurrency, base.concurrency, {
+      name: 'assets.concurrency', min: 1, integer: true,
+    }),
   }
 }
 
-/** Recursive scan, sorted, so processing order is identical between runs. */
+/**
+ * Recursive scan, sorted, so processing order is identical between runs.
+ *
+ * `lstat`, not `stat`, and the difference is the answer to a question this
+ * codebase had already settled once. hash-tree.ts walks the *output* tree and
+ * refuses a symbolic link outright; this walked the *source* tree and followed
+ * one silently -- the same axis, the opposite answer, and no stated reason for
+ * the disagreement. Two walks that disagree stay that way until someone reads
+ * both, which is how the two spellings of isInside() and the two pools got here.
+ *
+ * Refusing rather than skipping, for three reasons that all end in the same
+ * place. A directory link makes this recurse until the stack blows, and it can
+ * point outside `sources` entirely -- past the disjoint-roots check, which
+ * compares resolved paths and says so. A link into the derivative cache turns
+ * the keep-set into a cycle. And a *broken* link used to crash the build with a
+ * bare ENOENT from `stat`, several frames from anything naming the file, because
+ * the ENOENT guard below covers the readdir and not the entry.
+ *
+ * Terminal, like hash-tree's: a layout is a configuration, not a moment.
+ */
 export async function findSources(dir: string): Promise<string[]> {
   const out: string[] = []
   const walk = async (d: string) => {
@@ -77,9 +107,37 @@ export async function findSources(dir: string): Promise<string[]> {
     }
     for (const name of entries.sort()) {
       const p = join(d, name)
-      const s = await stat(p)
-      if (s.isDirectory()) await walk(p)
-      else if (SOURCE_EXTENSIONS.has(extname(name).toLowerCase())) out.push(p)
+      // lstat answers about this entry rather than about whatever it points at,
+      // which is what makes a broken link a refusal here instead of an ENOENT
+      // from three frames down.
+      const s = await lstat(p)
+      if (s.isSymbolicLink()) {
+        throw new RailError(
+          'assets.symlink',
+          true,
+          `${relative(dir, p).split(sep).join('/')} is a symbolic link, and the asset source ` +
+          `tree this build scans is regular files and directories. Following it would encode ` +
+          `and publish images from outside the source directory — for a directory link, an ` +
+          `arbitrary number of them, or a cycle this walk does not terminate on. Copy the ` +
+          `content in instead.`)
+      }
+      if (s.isDirectory()) {
+        await walk(p)
+        continue
+      }
+      if (!SOURCE_EXTENSIONS.has(extname(name).toLowerCase())) continue
+      if (!s.isFile()) {
+        // A FIFO named hero.png reaches sharp and blocks there, so the build
+        // stops with no error and no output. Only checked for entries this scan
+        // would otherwise pick up, so an unrelated socket in the directory still
+        // costs nothing.
+        throw new RailError(
+          'assets.entry',
+          true,
+          `${relative(dir, p).split(sep).join('/')} looks like a source image but is not a ` +
+          `regular file. Reading it would block or fail somewhere with less context than here.`)
+      }
+      out.push(p)
     }
   }
   await walk(dir)

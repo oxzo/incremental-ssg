@@ -765,6 +765,134 @@ MUTATIONS: list[Mutation] = [
         "a cap that failed to parse is NaN, and `requests === NaN` is false at every request",
         "test/numeric-guards.test.ts",
     ),
+    # --- refusals that inherited the transient default ------------------------
+    #
+    # Five throw sites across four files that were plain Errors, and a plain
+    # Error is not a RailError, so isTerminal() reported transient for all of
+    # them. That default is deliberate and right for an unclassified failure --
+    # a crash, a blip, a bug are all worth retrying -- and wrong for a refusal
+    # that has already worked out its answer cannot change. Under `serve` the
+    # difference is a service retrying a schema version comparison, a missing
+    # module export, or a caller's own bug on a widening backoff.
+    #
+    # Each mutation restores the old answer rather than the old *type*: flipping
+    # the bit is the defect these had, and it is the half a test can see.
+    Mutation(
+        "store-schema-mismatch-retried",
+        "src/store.ts",
+        "      throw new RailError(\n        'store.schema',\n        true,\n        `store schema ${found} != ${STORE_SCHEMA} at ${this.path}. Delete the `",
+        "      throw new RailError(\n        'store.schema',\n        false,\n        `store schema ${found} != ${STORE_SCHEMA} at ${this.path}. Delete the `",
+        "the file records one version and the binary expects another, and the next run compares the same two numbers",
+        "test/store.test.ts",
+    ),
+    Mutation(
+        "site-config-unloadable-retried",
+        "src/config.ts",
+        "    throw new RailError(\n      'site.config',\n      true,",
+        "    throw new RailError(\n      'site.config',\n      false,",
+        "ESM caches by URL, so the import that failed returns the same answer for the life of the process",
+        "test/config.test.ts",
+    ),
+    Mutation(
+        "site-config-missing-field-retried",
+        "src/config.ts",
+        "      throw new RailError('site.config', true, `${modulePath}: SiteConfig is missing",
+        "      throw new RailError('site.config', false, `${modulePath}: SiteConfig is missing",
+        "a field the site module does not declare is not one a retry supplies",
+        "test/config.test.ts",
+    ),
+    Mutation(
+        "assets-gc-unsealed-retried",
+        "src/asset-cache.ts",
+        "        'assets.gc-unsealed',\n        true,",
+        "        'assets.gc-unsealed',\n        false,",
+        "reaching gc() without seal() is a fact about the code, and the next attempt runs the same two calls in the same order",
+        "test/asset-cache.test.ts",
+    ),
+    # The one in this group that is a judgement rather than a reading, and the
+    # reason it gets a mutation of its own. README.md calls this the same rail
+    # shape as DocumentStore.deleteMissing and the deploy diff -- and those two
+    # are classified differently from each other, so "same shape" settles
+    # nothing. What settles it is where the keep-set comes from: a CMS listing
+    # can come back short for a moment, a directory the build just walked cannot.
+    Mutation(
+        "assets-gc-ratio-retried",
+        "src/asset-cache.ts",
+        "        'assets.gc-ratio',\n        true,",
+        "        'assets.gc-ratio',\n        false,",
+        "the keep-set is a local scan, so a service retrying this re-refuses forever while the site goes stale",
+        "test/asset-cache.test.ts",
+    ),
+    # --- the asset source walk, brought level with the tree walk --------------
+    #
+    # hash-tree.ts refuses a symbolic link; findSources() followed one, using
+    # `stat` where the other uses `lstat`. Same axis, opposite answers, and
+    # nothing recording that the difference was meant -- which is how this
+    # codebase ended up with two pools and two spellings of isInside().
+    Mutation(
+        "assets-symlink-followed",
+        "src/assets.ts",
+        "      if (s.isSymbolicLink()) {",
+        "      if (false) {",
+        "a directory link encodes and publishes an arbitrary subtree, and a cycle recurses until the stack blows",
+        "test/tree-walk.test.ts",
+    ),
+    # lstat itself carries no mutation, the same way hash-tree.ts's does not and
+    # for the same reason: `stat` is not imported here any more, so the swap dies
+    # on an unresolved import rather than on a missed defect -- a kill for the
+    # wrong reason, and worth less than the broken-link test that pins it.
+    Mutation(
+        "assets-fifo-source-read",
+        "src/assets.ts",
+        "      if (!s.isFile()) {",
+        "      if (false) {",
+        "a FIFO named hero.png reaches sharp and blocks there, so the build stops with no error and no output",
+        "test/tree-walk.test.ts",
+    ),
+    Mutation(
+        "assets-concurrency-unchecked",
+        "src/assets.ts",
+        "    concurrency: checkNumber(assets.concurrency, base.concurrency, {\n      name: 'assets.concurrency', min: 1, integer: true,\n    }),",
+        "    concurrency: assets.concurrency ?? base.concurrency,",
+        "pool(jobs, NaN) builds zero runners, runs zero jobs, and resolves successfully -- a build that encodes nothing and reports success",
+        "test/numeric-guards.test.ts",
+    ),
+    # --- an id listing entry that names no document ---------------------------
+    #
+    # The comment in listIds() already said an entry without a type cannot be
+    # compared against a (type, id) mirror, and the line under it compared it
+    # anyway against `String(undefined ?? '')`. This listing feeds deleteMissing,
+    # so an untyped entry does not merely go unmatched -- it reads as a deletion.
+    Mutation(
+        "cms-untyped-id-coerced",
+        "src/cms.ts",
+        "        if (typeof type !== 'string' || type === '') {",
+        "        if (false) {",
+        "an entry the CMS failed to type reads as a document that no longer exists, guarded only by the ratio ceiling",
+        "test/cms-http.test.ts",
+    ),
+    Mutation(
+        "cms-untyped-id-terminal",
+        "src/cms.ts",
+        "            'cms.untyped-id',\n            false,",
+        "            'cms.untyped-id',\n            true,",
+        "a half-migrated response is a fact about one listing at one moment, and halting on it needs a human for something that clears itself",
+        "test/cms-http.test.ts",
+    ),
+    # --- a refusal printed as a stack -----------------------------------------
+    #
+    # Not a correctness defect and it is here anyway: sync was the only command
+    # without .catch(die), so the two most carefully worded refusals in the
+    # codebase reached an operator as the first line of a stack trace. A rail
+    # nobody can read is most of the way to a rail that is not there.
+    Mutation(
+        "cli-sync-unhandled-rejection",
+        "src/cli.ts",
+        "  }).catch(die)\n  console.log(\n    `${r.strategy}:",
+        "  })\n  console.log(\n    `${r.strategy}:",
+        "an unhandled rejection prints the refusal as a stack with the explanation folded into the frames",
+        "test/cli-refusals.test.ts",
+    ),
     # --- draining a pool before reporting that it failed ----------------------
     #
     # Both pools used to reject while their work continued. The tell was not in

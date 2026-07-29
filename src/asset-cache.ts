@@ -22,6 +22,7 @@ import { readFile, writeFile, rename, mkdir, readdir, unlink, stat } from 'node:
 import { existsSync } from 'node:fs'
 import { join, basename, extname } from 'node:path'
 import { pool } from './pool.ts'
+import { RailError } from './rails.ts'
 
 export type Fmt = 'jpeg' | 'webp' | 'avif' | 'png'
 
@@ -208,7 +209,15 @@ export class AssetCache {
   async gc(opts: { maxDeleteRatio?: number; force?: boolean } = {}): Promise<{ deleted: number; bytes: number }> {
     const { maxDeleteRatio = 0.5, force = false } = opts
     if (!this.sealed && !force) {
-      throw new Error(
+      // Terminal: this fires only when a caller reached gc() without seal(),
+      // which is a fact about the code rather than about the run. Re-running
+      // executes the same two calls in the same order and lands here again.
+      // runAssetStage() seals immediately before collecting, so nothing in this
+      // repository can reach it -- it guards the next caller, and the next
+      // caller's bug is not something a retry fixes.
+      throw new RailError(
+        'assets.gc-unsealed',
+        true,
         'AssetCache.gc() requires seal() first — an unsealed instance may hold an ' +
         'incomplete keep-set from a partial or failed build, and collecting against ' +
         'it deletes live derivatives. Pass {force:true} only if you mean it.')
@@ -219,7 +228,29 @@ export class AssetCache {
 
     // Guards against the "processed 3 files, collected 20,000" failure.
     if (files.length > 0 && doomed.length / files.length > maxDeleteRatio && !force) {
-      throw new Error(
+      // Terminal, and the classification is the argument rather than the check.
+      // README.md groups this with DocumentStore.deleteMissing and the deploy
+      // diff as one rail shape, and those two are classified *differently* --
+      // so "same shape" does not settle it, and the deciding question is where
+      // each keep-set comes from.
+      //
+      // deleteMissing's comes from a CMS listing, which is remote and can come
+      // back short for a moment, so it is transient. This one and the deploy
+      // diff's both come from a local scan the build just performed: the keep-
+      // set is every source in `sources`, walked from the filesystem. Re-running
+      // walks the same directory and reaches the same ratio, so the deploy
+      // diff's reasoning is the one that applies -- a service retrying this
+      // would re-refuse every few seconds forever while the site went stale.
+      //
+      // The narrow exception, said plainly rather than hidden: `findSources`
+      // treats a missing sources directory as zero sources, so an unmounted
+      // network path produces an empty keep-set and fires this rail, and *that*
+      // clears itself. It is the same doubt the deploy diff already accepted
+      // when it chose terminal, and halting on a vanished source directory is
+      // the better error of the two.
+      throw new RailError(
+        'assets.gc-ratio',
+        true,
         `AssetCache.gc() would delete ${doomed.length} of ${files.length} derivatives ` +
         `(${((doomed.length / files.length) * 100).toFixed(0)}%), over the ${maxDeleteRatio * 100}% ` +
         `limit. This usually means the build did not process every source. ` +
